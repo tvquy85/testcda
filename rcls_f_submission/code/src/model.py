@@ -280,7 +280,7 @@ class StockMixer(nn.Module):
         if self.time_fc_ is None:
             self.time_fc_ = nn.Linear(time_steps * 2 + scale_dim, 1)
 
-    def forward(self, inputs):
+    def forward(self, inputs, manual_pi=None):
         x = inputs.permute(0, 2, 1)
         x = self.conv(x)
         x = x.permute(0, 2, 1)
@@ -288,7 +288,7 @@ class StockMixer(nn.Module):
         y = self.channel_fc(y).squeeze(-1)
 
         if self.model_name.startswith("rcls_delta"):
-            z = self.stock_mixer(y, inputs)
+            z = self.stock_mixer(y, inputs, manual_pi=manual_pi)
         else:
             mixed = self.stock_mixer(y)
             if isinstance(mixed, tuple):

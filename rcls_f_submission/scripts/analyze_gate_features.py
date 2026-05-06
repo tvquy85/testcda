@@ -8,6 +8,7 @@ import pandas as pd
 BEHAVIOR_COLUMNS = [
     "dataset",
     "model",
+    "regime_mode",
     "seed",
     "num_days",
     "num_regimes",
@@ -27,6 +28,7 @@ BEHAVIOR_COLUMNS = [
 CORR_COLUMNS = [
     "dataset",
     "model",
+    "regime_mode",
     "seed",
     "feature",
     "regime",
@@ -54,6 +56,13 @@ def get_results_dir(args):
     if args.results_dir is not None:
         return args.results_dir
     return args.output_root / "results"
+
+
+def frame_regime_mode(df):
+    if "regime_mode" in df.columns and df["regime_mode"].notna().any():
+        value = str(df["regime_mode"].dropna().iloc[0])
+        return value if value else "legacy_delta"
+    return "legacy_delta"
 
 
 def active_regime_cols(df):
@@ -108,6 +117,7 @@ def summarize_behavior(df):
     row = {
         "dataset": str(day_df["dataset"].iloc[0]),
         "model": str(day_df["model"].iloc[0]),
+        "regime_mode": frame_regime_mode(day_df),
         "seed": int(day_df["seed"].iloc[0]),
         "num_days": int(day_df["day_idx"].nunique()),
         "num_regimes": len(regime_cols),
@@ -137,6 +147,7 @@ def summarize_corr(df):
     day_df = df.drop_duplicates("day_idx").copy()
     dataset = str(day_df["dataset"].iloc[0])
     model = str(day_df["model"].iloc[0])
+    regime_mode = frame_regime_mode(day_df)
     seed = int(day_df["seed"].iloc[0])
     rows = []
     for output_feature, source_col in FEATURE_ALIASES.items():
@@ -147,6 +158,7 @@ def summarize_corr(df):
                 {
                     "dataset": dataset,
                     "model": model,
+                    "regime_mode": regime_mode,
                     "seed": seed,
                     "feature": output_feature,
                     "regime": regime_col.replace("regime_", ""),

@@ -14,6 +14,18 @@ import torch.nn.functional as F
 from evaluator import evaluate
 from model import StockMixer, get_loss
 from model_rcls_delta import REGIME_FEATURE_NAMES
+from regime_modes import (
+    MANUAL_REGIME_MODES,
+    NEW_REGIME_MODES,
+    PSEUDO_REGIME_MODES,
+    REGIME_DIAGNOSTIC_COLUMNS,
+    REGIME_MODES,
+    apply_regime_artifact,
+    fit_regime_artifact,
+    make_regime_lookup,
+    manual_gate_from_row,
+    regime_summary,
+)
 
 
 BASE_NUMPY_SEED = 123456789
@@ -102,6 +114,13 @@ PREDICTION_COLUMNS = [
     "dispersion_lookback",
     "mean_abs_ret_lookback",
     "stress_source",
+    "regime_mode",
+    "regime_label",
+    "regime_confidence",
+    "regime_margin",
+    "breadth_score",
+    "stress_score",
+    "corr_score",
     "regime_0",
     "regime_1",
     "regime_2",
@@ -119,6 +138,13 @@ GATE_FEATURE_COLUMNS = [
     "seed",
     "day_idx",
     "split",
+    "regime_mode",
+    "regime_label",
+    "regime_confidence",
+    "regime_margin",
+    "breadth_score",
+    "stress_score",
+    "corr_score",
     "regime_0",
     "regime_1",
     "regime_2",
@@ -143,6 +169,9 @@ CONFIG_SUMMARY_FIELDS = [
     "model",
     "dataset",
     "num_regimes",
+    "regime_mode",
+    "regime_temperature",
+    "regime_jump_min_run",
     "uniform_gate",
     "gate_feature_mode",
     "gate_pseudo_label",
@@ -167,6 +196,7 @@ EPOCH_DIAGNOSTIC_COLUMNS = [
     "model",
     "seed",
     "epoch",
+    "regime_mode",
     "loss_main",
     "loss_gate_ce",
     "loss_gate_confidence",
@@ -201,6 +231,16 @@ METADATA_COLUMNS = [
     "git_commit",
     "device",
     "num_regimes",
+    "regime_mode",
+    "regime_temperature",
+    "regime_jump_min_run",
+    "regime_label_counts",
+    "train_regime_switch_count",
+    "valid_regime_switch_count",
+    "test_regime_switch_count",
+    "train_regime_occupancy_min",
+    "valid_regime_occupancy_min",
+    "test_regime_occupancy_min",
     "delta_scale",
     "delta_trainable_scale",
     "delta_dropout",
@@ -308,6 +348,14 @@ def parse_args(argv=None):
     parser.add_argument("--gate-pseudo-final-weight", type=float, default=0.005)
     parser.add_argument("--gate-confidence-weight", type=float, default=0.0005)
     parser.add_argument("--expert-diversity-weight", type=float, default=0.00001)
+    parser.add_argument(
+        "--regime-mode",
+        choices=REGIME_MODES,
+        default="legacy_delta",
+        help="Regime label/gate mode. legacy_delta preserves the original RCLS-Delta behavior.",
+    )
+    parser.add_argument("--regime-temperature", type=float, default=0.5)
+    parser.add_argument("--regime-jump-min-run", type=int, default=3)
     parser.add_argument("--freeze-base-epochs", type=int, default=0)
     parser.add_argument("--warmstart-checkpoint", default="")
     parser.add_argument(
@@ -377,6 +425,10 @@ def resolve_args(parser, args):
         parser.error("--delta-dropout must be in [0, 1)")
     if args.gate_temperature <= 0.0:
         parser.error("--gate-temperature must be positive")
+    if args.regime_temperature <= 0.0:
+        parser.error("--regime-temperature must be positive")
+    if args.regime_jump_min_run <= 0:
+        parser.error("--regime-jump-min-run must be positive")
     if args.gate_pseudo_warmup_epochs < 0:
         parser.error("--gate-pseudo-warmup-epochs must be non-negative")
     if args.freeze_base_epochs < 0:
@@ -397,7 +449,14 @@ def resolve_args(parser, args):
 
     if is_rcls_delta(args.model):
         args.num_regimes = variant_num_regimes(args.model, args.num_regimes)
+        if args.regime_mode == "pseudo_market3" and args.num_regimes != 3:
+            parser.error("--regime-mode pseudo_market3 requires an rcls_delta_k3 model")
+        if args.regime_mode in NEW_REGIME_MODES and args.regime_mode != "pseudo_market3":
+            if args.num_regimes != 2:
+                parser.error("--regime-mode {} requires an rcls_delta_k2 model".format(args.regime_mode))
         if args.model.endswith("_uniform"):
+            if args.regime_mode != "legacy_delta":
+                parser.error("Non-legacy --regime-mode is incompatible with uniform-gate variants")
             args.uniform_gate = True
             args.gate_pseudo_label = False
             args.gate_pseudo_weight = 0.0
@@ -418,12 +477,24 @@ def resolve_args(parser, args):
             args.expert_diversity_weight = 0.0
         if args.model == "rcls_delta_k1":
             args.num_regimes = 1
+            if args.regime_mode != "legacy_delta":
+                parser.error("Non-legacy --regime-mode requires k2 or k3, not rcls_delta_k1")
             args.gate_pseudo_label = False
             args.gate_pseudo_weight = 0.0
             args.gate_pseudo_final_weight = 0.0
             args.gate_confidence_weight = 0.0
             args.expert_diversity_weight = 0.0
+        if args.regime_mode in PSEUDO_REGIME_MODES:
+            args.gate_pseudo_label = True
+        if args.regime_mode in MANUAL_REGIME_MODES:
+            args.gate_pseudo_label = False
+            args.gate_pseudo_weight = 0.0
+            args.gate_pseudo_final_weight = 0.0
+            args.gate_confidence_weight = 0.0
     else:
+        if args.regime_mode != "legacy_delta":
+            parser.error("--regime-mode {} requires an rcls_delta model".format(args.regime_mode))
+        args.regime_mode = "legacy_delta"
         args.uniform_gate = False
         args.gate_pseudo_label = False
         args.gate_pseudo_weight = 0.0
@@ -646,6 +717,12 @@ class Trainer:
             self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         self.infer_time_ms_per_day = 0.0
         self.regime_stats = self.fit_regime_stats(self.train_offsets)
+        self.regime_rows = []
+        self.regime_lookup = {}
+        self.regime_artifact = None
+        self.regime_summary_stats = {}
+        if is_rcls_delta(args.model) and args.regime_mode in NEW_REGIME_MODES:
+            self.setup_new_regime_mode()
 
         self.model = StockMixer(
             stocks=config["stock_num"],
@@ -673,6 +750,96 @@ class Trainer:
         self.num_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
         self.save_regime_thresholds()
 
+    def run_stem(self):
+        base = "{}_{}_seed{}".format(self.args.model, self.args.market, self.result_seed)
+        if self.args.regime_mode == "legacy_delta":
+            return base
+        return "{}_{}_{}_seed{}".format(
+            self.args.model,
+            self.args.regime_mode,
+            self.args.market,
+            self.result_seed,
+        )
+
+    def split_offsets(self):
+        valid_start = self.config["valid_index"] - self.args.lookback_length - self.args.steps + 1
+        valid_end = self.config["test_index"] - self.args.lookback_length - self.args.steps + 1
+        test_start = self.config["test_index"] - self.args.lookback_length - self.args.steps + 1
+        test_end = self.trade_dates - self.args.lookback_length - self.args.steps + 1
+        return {
+            "train": self.train_offsets,
+            "valid": np.arange(valid_start, valid_end, dtype=int),
+            "test": np.arange(test_start, test_end, dtype=int),
+        }
+
+    def build_regime_feature_rows(self):
+        rows = []
+        for split, offsets in self.split_offsets().items():
+            for offset in offsets:
+                offset = int(offset)
+                row = {
+                    "split": split,
+                    "offset": offset,
+                    "day_idx": int(self.offset_target_day(offset)),
+                }
+                row.update(self.offset_regime_features(offset))
+                rows.append(row)
+        return rows
+
+    def setup_new_regime_mode(self):
+        feature_rows = self.build_regime_feature_rows()
+        self.regime_artifact = fit_regime_artifact(
+            feature_rows,
+            self.args.regime_mode,
+            self.args.num_regimes,
+            jump_min_run=self.args.regime_jump_min_run,
+        )
+        self.regime_rows = apply_regime_artifact(feature_rows, self.regime_artifact)
+        self.regime_lookup = make_regime_lookup(self.regime_rows)
+        self.regime_summary_stats = regime_summary(self.regime_rows)
+
+    def regime_row(self, offset):
+        if not self.regime_lookup:
+            return None
+        return self.regime_lookup.get(int(offset))
+
+    def regime_diagnostics(self, offset):
+        row = self.regime_row(offset)
+        if row is None:
+            label = self.pseudo_regime_label(offset) if is_rcls_delta(self.args.model) else ""
+            return {
+                "regime_mode": self.args.regime_mode if is_rcls_delta(self.args.model) else "",
+                "regime_label": label,
+                "regime_confidence": "",
+                "regime_margin": "",
+                "breadth_score": "",
+                "stress_score": "",
+                "corr_score": "",
+            }
+        return {
+            "regime_mode": self.args.regime_mode,
+            "regime_label": int(row.get("regime_label", 0)),
+            "regime_confidence": safe_float(row.get("regime_confidence")),
+            "regime_margin": safe_float(row.get("regime_margin")),
+            "breadth_score": safe_float(row.get("breadth_score")),
+            "stress_score": safe_float(row.get("stress_score")),
+            "corr_score": safe_float(row.get("corr_score")),
+        }
+
+    def manual_pi_for_offset(self, offset):
+        if self.args.regime_mode not in MANUAL_REGIME_MODES:
+            return None
+        row = self.regime_row(offset)
+        pi = manual_gate_from_row(
+            row,
+            self.args.regime_mode,
+            self.args.num_regimes,
+            temperature=self.args.regime_temperature,
+        )
+        if pi is None:
+            return None
+        return pi.to(self.device)
+
     def load_warmstart_checkpoint(self, checkpoint):
         if not checkpoint:
             return
@@ -697,11 +864,7 @@ class Trainer:
         )
 
     def checkpoint_path(self):
-        name = "{}_{}_seed{}_best.pt".format(
-            self.args.model,
-            self.args.market,
-            self.result_seed,
-        )
+        name = "{}_best.pt".format(self.run_stem())
         return self.checkpoint_dir / name
 
     def save_checkpoint(self, best_epoch, best_valid_loss, optimizer_state_dict=None):
@@ -754,18 +917,18 @@ class Trainer:
     def save_regime_thresholds(self):
         if not is_rcls_delta(self.args.model):
             return
-        output = self.results_dir / "regime_thresholds_{}_{}_seed{}.json".format(
-            self.args.model,
-            self.args.market,
-            self.result_seed,
-        )
-        payload = dict(self.regime_stats)
+        output = self.results_dir / "regime_thresholds_{}.json".format(self.run_stem())
+        if self.regime_artifact is not None:
+            payload = self.regime_artifact.to_metadata()
+        else:
+            payload = dict(self.regime_stats)
         payload.update(
             {
                 "dataset": self.args.market,
                 "model": self.args.model,
                 "seed": self.result_seed,
                 "num_regimes": self.args.num_regimes,
+                "regime_mode": self.args.regime_mode,
                 "label_source": "lookback_only_train_offsets",
             }
         )
@@ -775,6 +938,11 @@ class Trainer:
     def pseudo_regime_label(self, offset):
         if not is_rcls_delta(self.args.model) or self.args.num_regimes <= 1:
             return 0
+        if self.args.regime_mode in NEW_REGIME_MODES:
+            row = self.regime_row(offset)
+            if row is None:
+                return 0
+            return int(row.get("regime_label", 0))
         features = self.offset_regime_features(offset)
         values = np.asarray([features[name] for name in REGIME_FEATURE_NAMES], dtype=float)
         mean = np.asarray(self.regime_stats["feature_mean"], dtype=float)
@@ -857,6 +1025,7 @@ class Trainer:
     def gate_feature_row(self, split_name, cur_offset):
         values, entropy, dominant = self.gate_summary()
         features = self.offset_regime_features(cur_offset)
+        regime_diag = self.regime_diagnostics(cur_offset)
         day_idx = self.offset_target_day(cur_offset)
         row = {
             "dataset": self.args.market,
@@ -864,6 +1033,13 @@ class Trainer:
             "seed": self.result_seed,
             "day_idx": int(day_idx),
             "split": split_name,
+            "regime_mode": regime_diag["regime_mode"],
+            "regime_label": regime_diag["regime_label"],
+            "regime_confidence": regime_diag["regime_confidence"],
+            "regime_margin": regime_diag["regime_margin"],
+            "breadth_score": regime_diag["breadth_score"],
+            "stress_score": regime_diag["stress_score"],
+            "corr_score": regime_diag["corr_score"],
             "regime_0": values[0],
             "regime_1": values[1],
             "regime_2": values[2],
@@ -887,6 +1063,7 @@ class Trainer:
         gate_values, gate_entropy, dominant_regime = self.gate_summary()
         gate0, gate1, gate2 = gate_values
         day_idx = self.offset_target_day(cur_offset)
+        regime_diag = self.regime_diagnostics(cur_offset)
         pred = cur_rr[:, 0].detach().cpu().numpy()
         target = gt_batch[:, 0].detach().cpu().numpy()
         mask = mask_batch[:, 0].detach().cpu().numpy()
@@ -914,6 +1091,13 @@ class Trainer:
                     "dispersion_lookback": dispersion,
                     "mean_abs_ret_lookback": mean_abs_ret,
                     "stress_source": "lookback",
+                    "regime_mode": regime_diag["regime_mode"],
+                    "regime_label": regime_diag["regime_label"],
+                    "regime_confidence": regime_diag["regime_confidence"],
+                    "regime_margin": regime_diag["regime_margin"],
+                    "breadth_score": regime_diag["breadth_score"],
+                    "stress_score": regime_diag["stress_score"],
+                    "corr_score": regime_diag["corr_score"],
                     "regime_0": gate0,
                     "regime_1": gate1,
                     "regime_2": gate2,
@@ -945,7 +1129,7 @@ class Trainer:
                 data_batch, mask_batch, price_batch, gt_batch = self.to_device(
                     self.get_batch(cur_offset)
                 )
-                prediction = self.model(data_batch)
+                prediction = self.model(data_batch, manual_pi=self.manual_pi_for_offset(cur_offset))
                 cur_loss, cur_reg_loss, cur_rank_loss, cur_rr = get_loss(
                     prediction,
                     gt_batch,
@@ -995,9 +1179,7 @@ class Trainer:
         _, _, _, _, test_rows, test_gate_rows, test_elapsed = self.evaluate_range(
             test_index, self.trade_dates, split_name="test", collect_rows=True
         )
-        output = self.results_dir / "preds_{}_{}_seed{}.csv".format(
-            self.args.model, self.args.market, self.result_seed
-        )
+        output = self.results_dir / "preds_{}.csv".format(self.run_stem())
         with output.open("w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=PREDICTION_COLUMNS)
             writer.writeheader()
@@ -1007,11 +1189,7 @@ class Trainer:
                 writer.writerow(row)
         gate_rows = valid_gate_rows + test_gate_rows
         if is_rcls_delta(self.args.model) and gate_rows:
-            gate_output = self.results_dir / "gate_features_{}_{}_seed{}.csv".format(
-                self.args.model,
-                self.args.market,
-                self.result_seed,
-            )
+            gate_output = self.results_dir / "gate_features_{}.csv".format(self.run_stem())
             with gate_output.open("w", newline="") as f:
                 writer = csv.DictWriter(f, fieldnames=GATE_FEATURE_COLUMNS)
                 writer.writeheader()
@@ -1052,6 +1230,20 @@ class Trainer:
             "git_commit": git_commit(),
             "device": self.device_name,
             "num_regimes": self.args.num_regimes,
+            "regime_mode": self.args.regime_mode,
+            "regime_temperature": safe_float(self.args.regime_temperature),
+            "regime_jump_min_run": self.args.regime_jump_min_run,
+            "regime_label_counts": (
+                json.dumps(self.regime_artifact.label_counts, sort_keys=True)
+                if self.regime_artifact is not None
+                else ""
+            ),
+            "train_regime_switch_count": self.regime_summary_stats.get("train_regime_switch_count", ""),
+            "valid_regime_switch_count": self.regime_summary_stats.get("valid_regime_switch_count", ""),
+            "test_regime_switch_count": self.regime_summary_stats.get("test_regime_switch_count", ""),
+            "train_regime_occupancy_min": self.regime_summary_stats.get("train_regime_occupancy_min", ""),
+            "valid_regime_occupancy_min": self.regime_summary_stats.get("valid_regime_occupancy_min", ""),
+            "test_regime_occupancy_min": self.regime_summary_stats.get("test_regime_occupancy_min", ""),
             "delta_scale": safe_float(self.args.delta_scale),
             "delta_trainable_scale": self.args.delta_trainable_scale,
             "delta_dropout": safe_float(self.args.delta_dropout),
@@ -1073,7 +1265,7 @@ class Trainer:
             self.results_dir / "run_metadata.csv",
             METADATA_COLUMNS,
             row,
-            ["dataset", "model", "seed"],
+            ["dataset", "model", "seed", "regime_mode"],
         )
 
     def set_base_freeze(self, epoch):
@@ -1125,11 +1317,7 @@ class Trainer:
     def write_epoch_diagnostics(self, rows):
         if not rows:
             return
-        output = self.results_dir / "epoch_diagnostics_{}_{}_seed{}.csv".format(
-            self.args.model,
-            self.args.market,
-            self.result_seed,
-        )
+        output = self.results_dir / "epoch_diagnostics_{}.csv".format(self.run_stem())
         with output.open("w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=EPOCH_DIAGNOSTIC_COLUMNS)
             writer.writeheader()
@@ -1189,7 +1377,7 @@ class Trainer:
                     self.get_batch(offset)
                 )
                 self.optimizer.zero_grad()
-                prediction = self.model(data_batch)
+                prediction = self.model(data_batch, manual_pi=self.manual_pi_for_offset(offset))
                 cur_loss, cur_reg_loss, cur_rank_loss, _ = get_loss(
                     prediction,
                     gt_batch,
@@ -1255,6 +1443,7 @@ class Trainer:
                     "model": self.args.model,
                     "seed": self.result_seed,
                     "epoch": epoch + 1,
+                    "regime_mode": self.args.regime_mode,
                     "loss_main": safe_float(tra_main_loss),
                     "loss_gate_ce": safe_float(tra_gate_loss),
                     "loss_gate_confidence": safe_float(tra_conf_loss),

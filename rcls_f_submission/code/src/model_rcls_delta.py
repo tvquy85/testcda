@@ -149,12 +149,15 @@ class RCLSDeltaStockMixer(nn.Module):
             features.append(embedding_summary(h))
         return torch.cat(features, dim=0)
 
-    def forward(self, h, raw_x):
+    def forward(self, h, raw_x, manual_pi=None):
         z_base = self.base_stock_mixer(h)
 
         gate_features = self._gate_features(h, raw_x)
         logits = self.gate(gate_features)
-        if self.uniform_gate:
+        if manual_pi is not None:
+            pi = manual_pi.to(device=h.device, dtype=h.dtype).view(-1)
+            pi = pi / pi.sum().clamp_min(1e-6)
+        elif self.uniform_gate:
             pi = torch.ones_like(logits) / float(logits.numel())
         else:
             temperature = max(float(self.gate_temperature), 1e-6)

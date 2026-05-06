@@ -7,6 +7,7 @@ import pandas as pd
 EFFICIENCY_COLUMNS = [
     "dataset",
     "model",
+    "regime_mode",
     "seed",
     "num_params",
     "train_time_sec",
@@ -41,6 +42,8 @@ def main():
         print("No run metadata found; wrote empty {}".format(output))
         return
     metadata = pd.read_csv(metadata_path)
+    if "regime_mode" not in metadata.columns:
+        metadata["regime_mode"] = "legacy_delta"
     rows = metadata[EFFICIENCY_COLUMNS].copy()
     rows.to_csv(output, index=False)
     print("Wrote {}".format(output))

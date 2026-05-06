@@ -98,10 +98,23 @@ def main():
     if learned.last_delta_norm is None or learned.last_base_norm is None:
         raise AssertionError("learned forward did not populate delta/base norms")
 
+    manual = build_model("rcls_delta_k2", num_regimes=2, delta_scale=0.05, uniform_gate=False)
+    manual.eval()
+    manual_pi = torch.tensor([0.05, 0.95])
+    with torch.no_grad():
+        manual_pred = manual(x, manual_pi=manual_pi)
+    assert_shape(manual_pred, (N_STOCKS, 1), "manual-gate prediction")
+    observed_pi = manual.last_regime_prob.detach().cpu()
+    if observed_pi.ndim == 2:
+        observed_pi = observed_pi[0]
+    if not torch.allclose(observed_pi, manual_pi, atol=1e-6, rtol=0.0):
+        raise AssertionError("manual pi did not override learned gate: {}".format(observed_pi.tolist()))
+
     print("RCLS-Delta forward smoke passed.")
     print("identity_max_abs_diff={:.3e}".format(max_diff))
     print("uniform_pi={}".format([float(v) for v in uniform.last_regime_prob.detach().cpu()]))
     print("learned_pi={}".format([float(v) for v in pi]))
+    print("manual_pi={}".format([float(v) for v in observed_pi]))
 
 
 if __name__ == "__main__":

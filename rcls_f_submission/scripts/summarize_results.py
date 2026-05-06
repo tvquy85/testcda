@@ -9,6 +9,7 @@ import pandas as pd
 MAIN_COLUMNS = [
     "dataset",
     "model",
+    "regime_mode",
     "seed",
     "num_days",
     "num_rows",
@@ -24,6 +25,7 @@ MAIN_COLUMNS = [
 GATE_COLUMNS = [
     "dataset",
     "model",
+    "regime_mode",
     "seed",
     "split",
     "num_days",
@@ -42,6 +44,7 @@ GATE_COLUMNS = [
 GATE_STRESS_COLUMNS = [
     "dataset",
     "model",
+    "regime_mode",
     "seed",
     "split",
     "feature",
@@ -75,7 +78,9 @@ COMPARISON_COLUMNS = [
     "seed",
     "condition",
     "baseline_model",
+    "baseline_regime_mode",
     "model",
+    "regime_mode",
     "baseline_ic",
     "model_ic",
     "delta_ic",
@@ -104,6 +109,19 @@ def get_results_dir(args):
     if args.results_dir is not None:
         return args.results_dir
     return args.output_root / "results"
+
+
+def frame_regime_mode(df):
+    if "regime_mode" in df.columns and df["regime_mode"].notna().any():
+        value = str(df["regime_mode"].dropna().iloc[0])
+        return value if value else "legacy_delta"
+    return "legacy_delta"
+
+
+def result_stem(dataset, model, regime_mode, seed):
+    if regime_mode == "legacy_delta":
+        return "{}_{}_seed{}".format(model, dataset, seed)
+    return "{}_{}_{}_seed{}".format(model, regime_mode, dataset, seed)
 
 
 def safe_corr(a, b, method="pearson"):
@@ -192,9 +210,10 @@ def summarize_prediction_file(path):
         return None
     dataset = str(df["dataset"].iloc[0])
     model = str(df["model"].iloc[0])
+    regime_mode = frame_regime_mode(df)
     seed = int(df["seed"].iloc[0])
     metrics = compute_metrics(df)
-    row = {"dataset": dataset, "model": model, "seed": seed}
+    row = {"dataset": dataset, "model": model, "regime_mode": regime_mode, "seed": seed}
     row.update(metrics)
     return row
 
@@ -216,6 +235,7 @@ def write_gate_stats(path, results_dir):
 
     dataset = str(df["dataset"].iloc[0])
     model = str(df["model"].iloc[0])
+    regime_mode = frame_regime_mode(df)
     seed = int(df["seed"].iloc[0])
     day_probs = df[["day_idx"] + active_cols].drop_duplicates("day_idx")
     ent = (
@@ -232,6 +252,7 @@ def write_gate_stats(path, results_dir):
             {
                 "dataset": dataset,
                 "model": model,
+                "regime_mode": regime_mode,
                 "seed": seed,
                 "split": "test",
                 "num_days": int(day_probs["day_idx"].nunique()),
@@ -247,7 +268,9 @@ def write_gate_stats(path, results_dir):
                 "entropy_std": ent.std(ddof=0),
             }
         )
-    output = results_dir / "gate_stats_{}_{}_seed{}.csv".format(dataset, model, seed)
+    output = results_dir / "gate_stats_{}.csv".format(
+        result_stem(dataset, model, regime_mode, seed)
+    )
     pd.DataFrame(rows, columns=GATE_COLUMNS).to_csv(output, index=False)
     return rows
 
@@ -281,6 +304,7 @@ def gate_stress_relation_rows(path):
     day_df = df[["day_idx"] + available_features + active_cols].drop_duplicates("day_idx")
     dataset = str(df["dataset"].iloc[0])
     model = str(df["model"].iloc[0])
+    regime_mode = frame_regime_mode(df)
     seed = int(df["seed"].iloc[0])
     rows = []
     for feature in available_features:
@@ -291,6 +315,7 @@ def gate_stress_relation_rows(path):
                 {
                     "dataset": dataset,
                     "model": model,
+                    "regime_mode": regime_mode,
                     "seed": seed,
                     "split": "test",
                     "feature": feature,
@@ -359,6 +384,30 @@ def write_pilot_comparison(summary_rows, results_dir):
         return
 
     summary = pd.DataFrame(summary_rows)
+    metadata_path = results_dir / "run_metadata.csv"
+    metadata = pd.DataFrame()
+    if metadata_path.exists():
+        metadata = pd.read_csv(metadata_path)
+        if "regime_mode" not in metadata.columns:
+            metadata["regime_mode"] = "legacy_delta"
+
+    def run_condition(row):
+        if metadata.empty:
+            return "matched_results_dir"
+        candidates = metadata[
+            (metadata["dataset"].astype(str) == str(row["dataset"]))
+            & (metadata["model"].astype(str) == str(row["model"]))
+            & (metadata["regime_mode"].astype(str) == str(row.get("regime_mode", "legacy_delta")))
+            & (metadata["seed"].astype(str) == str(row["seed"]))
+        ]
+        if candidates.empty:
+            return "matched_results_dir"
+        item = candidates.iloc[0]
+        return "matched_pilot_{}epoch_patience{}".format(
+            int(item.get("epochs", 0)),
+            int(item.get("patience", 0)),
+        )
+
     rows = []
     for (dataset, seed), group in summary.groupby(["dataset", "seed"]):
         baseline = group[group["model"] == "stockmixer"]
@@ -371,9 +420,11 @@ def write_pilot_comparison(summary_rows, results_dir):
                 {
                     "dataset": dataset,
                     "seed": seed,
-                    "condition": "matched_pilot_60_epoch_patience8",
+                    "condition": run_condition(model_row),
                     "baseline_model": "stockmixer",
+                    "baseline_regime_mode": baseline.get("regime_mode", "legacy_delta"),
                     "model": model_row["model"],
+                    "regime_mode": model_row.get("regime_mode", "legacy_delta"),
                     "baseline_ic": baseline["ic"],
                     "model_ic": model_row["ic"],
                     "delta_ic": model_row["ic"] - baseline["ic"],
@@ -389,7 +440,7 @@ def write_pilot_comparison(summary_rows, results_dir):
                     "model_sharpe": model_row["sharpe"],
                     "delta_sharpe": model_row["sharpe"] - baseline["sharpe"],
                     "note": (
-                        "Gain uses only same-condition pilot StockMixer; "
+                        "Gain uses only same-condition StockMixer from this results dir; "
                         "historical 100-epoch baseline is reference-only."
                     ),
                 }

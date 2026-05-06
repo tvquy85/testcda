@@ -10,6 +10,7 @@ from summarize_results import compute_metrics
 RELIABILITY_COLUMNS = [
     "dataset",
     "model",
+    "regime_mode",
     "seed",
     "confidence_source",
     "selection_unit",
@@ -36,6 +37,13 @@ def get_results_dir(args):
     if args.results_dir is not None:
         return args.results_dir
     return args.output_root / "results"
+
+
+def frame_regime_mode(df):
+    if "regime_mode" in df.columns and df["regime_mode"].notna().any():
+        value = str(df["regime_mode"].dropna().iloc[0])
+        return value if value else "legacy_delta"
+    return "legacy_delta"
 
 
 def gate_entropy(frame, regime_cols):
@@ -97,6 +105,7 @@ def summarize_file(path):
         return []
     dataset = str(df["dataset"].iloc[0])
     model = str(df["model"].iloc[0])
+    regime_mode = frame_regime_mode(df)
     seed = int(df["seed"].iloc[0])
     df, confidence_source = add_confidence(df)
     selection_unit = "day" if confidence_source == "gate_entropy" else "stock_row"
@@ -112,6 +121,7 @@ def summarize_file(path):
             {
                 "dataset": dataset,
                 "model": model,
+                "regime_mode": regime_mode,
                 "seed": seed,
                 "confidence_source": confidence_source,
                 "selection_unit": selection_unit,
