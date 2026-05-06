@@ -270,7 +270,8 @@ def write_pilot_comparison(summary_rows, results_dir):
         if baseline.empty:
             continue
         baseline = baseline.iloc[0]
-        for _, model_row in group[group["model"].isin(["rcls_f_k1", "rcls_f_k3"])].iterrows():
+        comparator_rows = group[group["model"] != "stockmixer"]
+        for _, model_row in comparator_rows.iterrows():
             rows.append(
                 {
                     "dataset": dataset,

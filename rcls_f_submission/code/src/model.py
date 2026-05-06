@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from model_rcls import RCLSStockMixing
+from model_rcls_delta import RCLSDeltaStockMixer
 
 
 def build_activation(name):
@@ -206,8 +207,15 @@ class StockMixer(nn.Module):
         scale_mixer_activation=None,
         stock_activation="hardswish",
         model_name="stockmixer",
-        gate_hidden=128,
+        gate_hidden=64,
         rcls_dropout=0.10,
+        num_regimes=2,
+        delta_scale=0.05,
+        delta_trainable_scale=True,
+        delta_dropout=0.05,
+        gate_temperature=0.7,
+        gate_feature_mode="stress_embedding",
+        uniform_gate=False,
     ):
         super(StockMixer, self).__init__()
         scale_dim = 8
@@ -230,23 +238,47 @@ class StockMixer(nn.Module):
         self.conv = nn.Conv1d(in_channels=channels, out_channels=channels, kernel_size=2, stride=2)
         self.model_name = model_name
         self.last_regime_prob = None
-        if model_name == "stockmixer":
+        self.last_gate_logits = None
+        self.last_regime_features = None
+        self.last_delta_norm = None
+        self.last_base_norm = None
+        self.time_fc_ = None
+        if model_name in ("stockmixer", "stockmixer_ft"):
             self.stock_mixer = NoGraphMixer(stocks, market, activation=stock_activation)
         elif model_name in ("rcls_f", "rcls_f_k3", "rcls_f_k1"):
-            num_regimes = 1 if model_name == "rcls_f_k1" else 3
+            rcls_num_regimes = 1 if model_name == "rcls_f_k1" else 3
             self.stock_mixer = RCLSStockMixing(
                 n_stocks=stocks,
                 d_model=time_steps * 2 + scale_dim,
                 market_dim=market,
-                num_regimes=num_regimes,
+                num_regimes=rcls_num_regimes,
                 dropout=rcls_dropout,
                 activation=stock_activation,
                 gate_hidden=gate_hidden,
                 return_gate=True,
             )
+        elif model_name.startswith("rcls_delta"):
+            base_stock_mixer = NoGraphMixer(stocks, market, activation=stock_activation)
+            self.time_fc_ = nn.Linear(time_steps * 2 + scale_dim, 1)
+            self.stock_mixer = RCLSDeltaStockMixer(
+                base_stock_mixer=base_stock_mixer,
+                n_stocks=stocks,
+                d_model=time_steps * 2 + scale_dim,
+                market_dim=market,
+                num_regimes=num_regimes,
+                gate_hidden=gate_hidden,
+                dropout=delta_dropout,
+                activation=stock_activation,
+                delta_scale=delta_scale,
+                trainable_delta_scale=delta_trainable_scale,
+                gate_temperature=gate_temperature,
+                gate_feature_mode=gate_feature_mode,
+                uniform_gate=uniform_gate,
+            )
         else:
             raise ValueError("Unsupported model_name: {}".format(model_name))
-        self.time_fc_ = nn.Linear(time_steps * 2 + scale_dim, 1)
+        if self.time_fc_ is None:
+            self.time_fc_ = nn.Linear(time_steps * 2 + scale_dim, 1)
 
     def forward(self, inputs):
         x = inputs.permute(0, 2, 1)
@@ -255,13 +287,30 @@ class StockMixer(nn.Module):
         y = self.mixer(inputs, x)
         y = self.channel_fc(y).squeeze(-1)
 
-        mixed = self.stock_mixer(y)
-        if isinstance(mixed, tuple):
-            z, pi = mixed
-            self.last_regime_prob = pi.detach()
+        if self.model_name.startswith("rcls_delta"):
+            z = self.stock_mixer(y, inputs)
         else:
-            z = mixed
-            self.last_regime_prob = None
+            mixed = self.stock_mixer(y)
+            if isinstance(mixed, tuple):
+                z, pi = mixed
+                self.last_regime_prob = pi.detach()
+            else:
+                z = mixed
+                self.last_regime_prob = None
+                self.last_gate_logits = None
+                self.last_regime_features = None
+                self.last_delta_norm = None
+                self.last_base_norm = None
+        if hasattr(self.stock_mixer, "last_regime_prob"):
+            self.last_regime_prob = self.stock_mixer.last_regime_prob
+        if hasattr(self.stock_mixer, "last_gate_logits"):
+            self.last_gate_logits = self.stock_mixer.last_gate_logits
+        if hasattr(self.stock_mixer, "last_regime_features"):
+            self.last_regime_features = self.stock_mixer.last_regime_features
+        if hasattr(self.stock_mixer, "last_delta_norm"):
+            self.last_delta_norm = self.stock_mixer.last_delta_norm
+        if hasattr(self.stock_mixer, "last_base_norm"):
+            self.last_base_norm = self.stock_mixer.last_base_norm
         y = self.time_fc(y)
         z = self.time_fc_(z)
         return y + z

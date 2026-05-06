@@ -107,6 +107,39 @@ logs/<model>_<dataset>_seed0.log
 
 Do not fabricate missing runs. If a pilot run fails, report the exact failure and keep completed CSVs intact.
 
+## RCLS-Delta Follow-up
+
+RCLS-Delta should be evaluated after the direct RCLS-F negative result. It keeps StockMixer's static population path and applies a small residual regime correction.
+
+PowerShell smoke:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File rcls_f_submission/scripts/run_rcls_delta_smoke.ps1
+```
+
+Bash smoke:
+
+```bash
+bash rcls_f_submission/scripts/run_rcls_delta_smoke.sh
+```
+
+NASDAQ RCLS-Delta matrix:
+
+```text
+models: stockmixer, rcls_delta_identity, rcls_delta_k1, rcls_delta_k2_uniform,
+        rcls_delta_k2_nostress, rcls_delta_k2, rcls_delta_k3_uniform, rcls_delta_k3
+seed: 0
+epochs: 60
+patience: 8
+```
+
+RCLS-Delta acceptance:
+
+- `rcls_delta_identity` should match `stockmixer` up to small floating-point differences.
+- `rcls_delta_k2` should not show a constant gate in `summary_gate_behavior.csv`.
+- Gate-entropy selective evaluation is day-level; stock-row selection is used only for stock-level confidence such as `abs_pred`.
+- Use `rcls_delta_k2_uniform` to test whether learned routing adds value over a uniform expert mixture.
+
 ## Optional Strict NASDAQ Appendix
 
 To compare directly with the stored 100-epoch baseline note, run:

@@ -1,5 +1,6 @@
 import argparse
 import csv
+import json
 import pickle
 import random
 import subprocess
@@ -8,9 +9,11 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 from evaluator import evaluate
 from model import StockMixer, get_loss
+from model_rcls_delta import REGIME_FEATURE_NAMES
 
 
 BASE_NUMPY_SEED = 123456789
@@ -24,7 +27,20 @@ PAPER_NASDAQ = {
 }
 
 ACTIVATIONS = ("hardswish", "relu", "gelu")
-MODEL_CHOICES = ("stockmixer", "rcls_f_k3", "rcls_f_k1")
+GATE_FEATURE_MODES = ("stress_embedding", "embedding_only", "stress_only")
+MODEL_CHOICES = (
+    "stockmixer",
+    "stockmixer_ft",
+    "rcls_f_k3",
+    "rcls_f_k1",
+    "rcls_delta_identity",
+    "rcls_delta_k1",
+    "rcls_delta_k2",
+    "rcls_delta_k2_nostress",
+    "rcls_delta_k2_uniform",
+    "rcls_delta_k3",
+    "rcls_delta_k3_uniform",
+)
 EPOCH_PRESETS = {
     "smoke": 1,
     "quick": 20,
@@ -46,6 +62,31 @@ MARKET_CONFIGS = {
     },
 }
 
+
+def str_to_bool(value):
+    if isinstance(value, bool):
+        return value
+    lowered = value.lower()
+    if lowered in ("true", "1", "yes", "y"):
+        return True
+    if lowered in ("false", "0", "no", "n"):
+        return False
+    raise argparse.ArgumentTypeError("Expected true or false, got {}".format(value))
+
+
+def is_rcls_delta(model_name):
+    return model_name.startswith("rcls_delta")
+
+
+def variant_num_regimes(model_name, default_num_regimes):
+    if model_name == "rcls_delta_identity" or model_name == "rcls_delta_k1":
+        return 1
+    if "k3" in model_name:
+        return 3
+    if "k2" in model_name:
+        return 2
+    return default_num_regimes
+
 PREDICTION_COLUMNS = [
     "dataset",
     "model",
@@ -59,10 +100,43 @@ PREDICTION_COLUMNS = [
     "market_vol_lookback",
     "synchronism_lookback",
     "dispersion_lookback",
+    "mean_abs_ret_lookback",
     "stress_source",
     "regime_0",
     "regime_1",
     "regime_2",
+    "gate_entropy",
+    "dominant_regime",
+    "delta_norm",
+    "base_norm",
+    "delta_scale",
+    "pseudo_regime_label",
+]
+
+GATE_FEATURE_COLUMNS = [
+    "dataset",
+    "model",
+    "seed",
+    "day_idx",
+    "split",
+    "regime_0",
+    "regime_1",
+    "regime_2",
+    "gate_entropy",
+    "dominant_regime",
+    "market_ret_mean",
+    "market_ret_std",
+    "market_ret_last",
+    "downside_vol",
+    "dispersion",
+    "synchronism",
+    "mean_abs_ret",
+    "max_abs_ret",
+    "frac_positive",
+    "delta_norm",
+    "base_norm",
+    "delta_scale",
+    "pseudo_regime_label",
 ]
 
 METADATA_COLUMNS = [
@@ -85,6 +159,13 @@ METADATA_COLUMNS = [
     "torch_seed",
     "git_commit",
     "device",
+    "delta_scale",
+    "delta_trainable_scale",
+    "delta_dropout",
+    "gate_temperature",
+    "gate_feature_mode",
+    "uniform_gate",
+    "gate_pseudo_label",
 ]
 
 
@@ -141,8 +222,27 @@ def parse_args():
     parser.add_argument("--learning-rate", type=float, default=0.001)
     parser.add_argument("--alpha", type=float, default=0.1)
     parser.add_argument("--scale-factor", type=int, default=3)
-    parser.add_argument("--gate-hidden", type=int, default=128)
+    parser.add_argument("--gate-hidden", type=int, default=64)
     parser.add_argument("--rcls-dropout", type=float, default=0.10)
+    parser.add_argument("--num-regimes", type=int, default=2)
+    parser.add_argument("--delta-scale", type=float, default=0.05)
+    parser.add_argument("--delta-trainable-scale", type=str_to_bool, default=True)
+    parser.add_argument("--delta-dropout", type=float, default=0.05)
+    parser.add_argument("--gate-temperature", type=float, default=0.7)
+    parser.add_argument(
+        "--gate-feature-mode",
+        choices=GATE_FEATURE_MODES,
+        default="stress_embedding",
+    )
+    parser.add_argument("--uniform-gate", type=str_to_bool, default=False)
+    parser.add_argument("--gate-pseudo-label", type=str_to_bool, default=True)
+    parser.add_argument("--gate-pseudo-weight", type=float, default=0.02)
+    parser.add_argument("--gate-pseudo-warmup-epochs", type=int, default=20)
+    parser.add_argument("--gate-pseudo-final-weight", type=float, default=0.005)
+    parser.add_argument("--gate-confidence-weight", type=float, default=0.0005)
+    parser.add_argument("--expert-diversity-weight", type=float, default=0.00001)
+    parser.add_argument("--freeze-base-epochs", type=int, default=0)
+    parser.add_argument("--warmstart-checkpoint", default="")
     parser.add_argument(
         "--activation",
         choices=ACTIVATIONS,
@@ -204,6 +304,16 @@ def resolve_args(parser, args):
         parser.error("--gate-hidden must be positive")
     if args.rcls_dropout < 0.0 or args.rcls_dropout >= 1.0:
         parser.error("--rcls-dropout must be in [0, 1)")
+    if args.num_regimes <= 0:
+        parser.error("--num-regimes must be positive")
+    if args.delta_dropout < 0.0 or args.delta_dropout >= 1.0:
+        parser.error("--delta-dropout must be in [0, 1)")
+    if args.gate_temperature <= 0.0:
+        parser.error("--gate-temperature must be positive")
+    if args.gate_pseudo_warmup_epochs < 0:
+        parser.error("--gate-pseudo-warmup-epochs must be non-negative")
+    if args.freeze_base_epochs < 0:
+        parser.error("--freeze-base-epochs must be non-negative")
     if args.main_mixer_activation is None:
         args.main_mixer_activation = args.activation
     if args.scale_mixer_activation is None:
@@ -212,6 +322,27 @@ def resolve_args(parser, args):
         args.numpy_seed = BASE_NUMPY_SEED + args.seed
     if args.torch_seed is None:
         args.torch_seed = BASE_TORCH_SEED + args.seed
+    if is_rcls_delta(args.model):
+        args.num_regimes = variant_num_regimes(args.model, args.num_regimes)
+        if args.model.endswith("_uniform"):
+            args.uniform_gate = True
+            args.gate_pseudo_label = False
+            args.gate_confidence_weight = 0.0
+        if args.model.endswith("_nostress"):
+            args.gate_feature_mode = "embedding_only"
+        if args.model == "rcls_delta_identity":
+            args.num_regimes = 1
+            args.delta_scale = 0.0
+            args.delta_trainable_scale = False
+            args.uniform_gate = True
+            args.gate_pseudo_label = False
+            args.gate_confidence_weight = 0.0
+            args.expert_diversity_weight = 0.0
+    else:
+        args.uniform_gate = False
+        args.gate_pseudo_label = False
+        args.gate_confidence_weight = 0.0
+        args.expert_diversity_weight = 0.0
     args.save_predictions = not args.no_save_predictions
     return args
 
@@ -338,6 +469,46 @@ def safe_float(value):
     return value
 
 
+def lookback_regime_feature_dict(price_window, eps=1e-6):
+    prices = np.asarray(price_window, dtype=float)
+    if prices.ndim != 2 or prices.shape[1] < 2:
+        return {name: np.nan for name in REGIME_FEATURE_NAMES}
+    prices = np.nan_to_num(prices, nan=0.0, posinf=0.0, neginf=0.0)
+    prev = prices[:, :-1]
+    nxt = prices[:, 1:]
+    returns = (nxt - prev) / (np.abs(prev) + eps)
+    returns = np.nan_to_num(returns, nan=0.0, posinf=0.0, neginf=0.0)
+    returns = np.clip(returns, -0.5, 0.5)
+
+    market_ret_t = returns.mean(axis=0)
+    downside = np.minimum(market_ret_t, 0.0)
+    market_sign = np.sign(market_ret_t)[None, :]
+    stock_sign = np.sign(returns)
+    features = {
+        "market_ret_mean": float(np.mean(market_ret_t)),
+        "market_ret_std": float(np.std(market_ret_t)),
+        "market_ret_last": float(market_ret_t[-1]),
+        "downside_vol": float(np.sqrt(np.mean(downside ** 2) + eps)),
+        "dispersion": float(np.mean(np.std(returns, axis=0))),
+        "synchronism": float(np.mean(stock_sign == market_sign)),
+        "mean_abs_ret": float(np.mean(np.abs(returns))),
+        "max_abs_ret": float(np.max(np.abs(returns))),
+        "frac_positive": float(np.mean(returns > 0)),
+    }
+    return features
+
+
+def gate_entropy_from_probs(values):
+    probs = np.asarray([x for x in values if x != ""], dtype=float)
+    if probs.size == 0 or not np.isfinite(probs).any():
+        return ""
+    total = probs.sum()
+    if total <= 0:
+        return ""
+    probs = np.clip(probs / total, 1e-12, 1.0)
+    return safe_float(-(probs * np.log(probs)).sum())
+
+
 class Trainer:
     def __init__(self, args, config, device, data, run_index, device_name):
         self.args = args
@@ -350,11 +521,17 @@ class Trainer:
         self.torch_seed = args.torch_seed + run_index
         self.eod_data, self.mask_data, self.gt_data, self.price_data = data
         self.trade_dates = self.mask_data.shape[1]
-        self.batch_offsets = np.arange(start=0, stop=config["valid_index"], dtype=int)
+        self.train_offset_end = (
+            config["valid_index"] - args.lookback_length - args.steps + 1
+        )
+        if self.train_offset_end <= 0:
+            raise ValueError("No valid training offsets for this configuration.")
+        self.train_offsets = np.arange(start=0, stop=self.train_offset_end, dtype=int)
         self.output_root = args.output_root.resolve()
         self.results_dir = self.output_root / "results"
         self.results_dir.mkdir(parents=True, exist_ok=True)
         self.infer_time_ms_per_day = 0.0
+        self.regime_stats = self.fit_regime_stats(self.train_offsets)
 
         self.model = StockMixer(
             stocks=config["stock_num"],
@@ -369,9 +546,105 @@ class Trainer:
             model_name=args.model,
             gate_hidden=args.gate_hidden,
             rcls_dropout=args.rcls_dropout,
+            num_regimes=args.num_regimes,
+            delta_scale=args.delta_scale,
+            delta_trainable_scale=args.delta_trainable_scale,
+            delta_dropout=args.delta_dropout,
+            gate_temperature=args.gate_temperature,
+            gate_feature_mode=args.gate_feature_mode,
+            uniform_gate=args.uniform_gate,
         ).to(device)
+        self.load_warmstart_checkpoint(args.warmstart_checkpoint)
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=args.learning_rate)
         self.num_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        self.save_regime_thresholds()
+
+    def load_warmstart_checkpoint(self, checkpoint):
+        if not checkpoint:
+            return
+        path = Path(checkpoint)
+        if not path.exists():
+            raise FileNotFoundError("Warmstart checkpoint not found: {}".format(path))
+        payload = torch.load(path, map_location=self.device)
+        state_dict = payload.get("state_dict", payload) if isinstance(payload, dict) else payload
+        missing, unexpected = self.model.load_state_dict(state_dict, strict=False)
+        print(
+            "Loaded warmstart checkpoint {} | missing={} | unexpected={}".format(
+                path,
+                len(missing),
+                len(unexpected),
+            )
+        )
+
+    def offset_target_day(self, offset):
+        return offset + self.args.lookback_length + self.args.steps - 1
+
+    def offset_regime_features(self, offset):
+        seq_len = self.args.lookback_length
+        prices = self.price_data[:, offset : offset + seq_len]
+        return lookback_regime_feature_dict(prices)
+
+    def fit_regime_stats(self, offsets):
+        values = []
+        for offset in offsets:
+            features = self.offset_regime_features(int(offset))
+            values.append([features[name] for name in REGIME_FEATURE_NAMES])
+        matrix = np.asarray(values, dtype=float)
+        mean = np.nanmean(matrix, axis=0)
+        std = np.nanstd(matrix, axis=0)
+        std = np.where(std > 1e-8, std, 1.0)
+        z = (matrix - mean[None, :]) / std[None, :]
+        stress_k2 = z[:, 1] + z[:, 4] + z[:, 5] + z[:, 6]
+        stress_k3 = z[:, 1] + z[:, 5]
+        dispersion = z[:, 4]
+        return {
+            "feature_names": REGIME_FEATURE_NAMES,
+            "feature_mean": mean.tolist(),
+            "feature_std": std.tolist(),
+            "stress_k2_q70": float(np.nanquantile(stress_k2, 0.70)),
+            "stress_k3_q70": float(np.nanquantile(stress_k3, 0.70)),
+            "dispersion_q70": float(np.nanquantile(dispersion, 0.70)),
+        }
+
+    def save_regime_thresholds(self):
+        if not is_rcls_delta(self.args.model):
+            return
+        output = self.results_dir / "regime_thresholds_{}_{}_seed{}.json".format(
+            self.args.model,
+            self.args.market,
+            self.result_seed,
+        )
+        payload = dict(self.regime_stats)
+        payload.update(
+            {
+                "dataset": self.args.market,
+                "model": self.args.model,
+                "seed": self.result_seed,
+                "num_regimes": self.args.num_regimes,
+                "label_source": "lookback_only_train_offsets",
+            }
+        )
+        with output.open("w") as f:
+            json.dump(payload, f, indent=2, sort_keys=True)
+
+    def pseudo_regime_label(self, offset):
+        if not is_rcls_delta(self.args.model) or self.args.num_regimes <= 1:
+            return 0
+        features = self.offset_regime_features(offset)
+        values = np.asarray([features[name] for name in REGIME_FEATURE_NAMES], dtype=float)
+        mean = np.asarray(self.regime_stats["feature_mean"], dtype=float)
+        std = np.asarray(self.regime_stats["feature_std"], dtype=float)
+        z = (values - mean) / std
+        if self.args.num_regimes == 2:
+            stress = z[1] + z[4] + z[5] + z[6]
+            return int(stress >= self.regime_stats["stress_k2_q70"])
+        stress = z[1] + z[5]
+        dispersion = z[4]
+        if stress >= self.regime_stats["stress_k3_q70"]:
+            return 1
+        if dispersion >= self.regime_stats["dispersion_q70"]:
+            return 2
+        return 0
 
     def get_batch(self, offset):
         seq_len = self.args.lookback_length
@@ -389,23 +662,13 @@ class Trainer:
         return tuple(torch.as_tensor(x, dtype=torch.float32, device=self.device) for x in batch)
 
     def lookback_stress_features(self, offset):
-        seq_len = self.args.lookback_length
-        prices = np.asarray(self.price_data[:, offset : offset + seq_len], dtype=float)
-        if prices.shape[1] < 2:
-            return "", "", ""
-        prev = prices[:, :-1]
-        nxt = prices[:, 1:]
-        denom = np.where(np.abs(prev) > 1e-12, prev, np.nan)
-        returns = (nxt - prev) / denom
-        with np.errstate(invalid="ignore"):
-            market_ret = np.nanmean(returns, axis=0)
-            market_vol = np.nanstd(market_ret)
-            dispersion = np.nanmean(np.nanstd(returns, axis=0))
-            market_sign = np.sign(market_ret)[None, :]
-            valid = np.isfinite(returns) & np.isfinite(market_sign)
-            matches = np.where(valid, np.sign(returns) == market_sign, np.nan)
-            synchronism = np.nanmean(matches)
-        return safe_float(market_vol), safe_float(synchronism), safe_float(dispersion)
+        features = self.offset_regime_features(offset)
+        return (
+            safe_float(features["market_ret_std"]),
+            safe_float(features["synchronism"]),
+            safe_float(features["dispersion"]),
+            safe_float(features["mean_abs_ret"]),
+        )
 
     def gate_values(self):
         pi = getattr(self.model, "last_regime_prob", None)
@@ -419,13 +682,75 @@ class Trainer:
             values.append("")
         return values[:3]
 
+    def model_scalar(self, attr_name):
+        value = getattr(self.model, attr_name, None)
+        if value is None:
+            return ""
+        if torch.is_tensor(value):
+            value = value.detach().cpu().item()
+        return safe_float(value)
+
+    def delta_scale_value(self):
+        mixer = getattr(self.model, "stock_mixer", None)
+        value = getattr(mixer, "delta_scale", None)
+        if value is None:
+            return ""
+        if torch.is_tensor(value):
+            value = value.detach().cpu().item()
+        return safe_float(value)
+
+    def gate_summary(self):
+        values = self.gate_values()
+        numeric = [float(x) for x in values if x != ""]
+        entropy = gate_entropy_from_probs(numeric)
+        if numeric:
+            dominant = int(np.argmax(numeric))
+        else:
+            dominant = ""
+        return values, entropy, dominant
+
+    def gate_feature_row(self, split_name, cur_offset):
+        values, entropy, dominant = self.gate_summary()
+        features = self.offset_regime_features(cur_offset)
+        day_idx = self.offset_target_day(cur_offset)
+        row = {
+            "dataset": self.args.market,
+            "model": self.args.model,
+            "seed": self.result_seed,
+            "day_idx": int(day_idx),
+            "split": split_name,
+            "regime_0": values[0],
+            "regime_1": values[1],
+            "regime_2": values[2],
+            "gate_entropy": entropy,
+            "dominant_regime": dominant,
+            "delta_norm": self.model_scalar("last_delta_norm"),
+            "base_norm": self.model_scalar("last_base_norm"),
+            "delta_scale": self.delta_scale_value(),
+            "pseudo_regime_label": (
+                self.pseudo_regime_label(cur_offset) if is_rcls_delta(self.args.model) else ""
+            ),
+        }
+        for name in REGIME_FEATURE_NAMES:
+            row[name] = safe_float(features[name])
+        return row
+
     def prediction_rows(self, split_name, cur_offset, result_offset, cur_rr, gt_batch, mask_batch):
-        market_vol, synchronism, dispersion = self.lookback_stress_features(cur_offset)
-        gate0, gate1, gate2 = self.gate_values()
-        day_idx = cur_offset + self.args.lookback_length + self.args.steps - 1
+        market_vol, synchronism, dispersion, mean_abs_ret = self.lookback_stress_features(
+            cur_offset
+        )
+        gate_values, gate_entropy, dominant_regime = self.gate_summary()
+        gate0, gate1, gate2 = gate_values
+        day_idx = self.offset_target_day(cur_offset)
         pred = cur_rr[:, 0].detach().cpu().numpy()
         target = gt_batch[:, 0].detach().cpu().numpy()
         mask = mask_batch[:, 0].detach().cpu().numpy()
+        delta_norm = self.model_scalar("last_delta_norm")
+        base_norm = self.model_scalar("last_base_norm")
+        delta_scale = self.delta_scale_value()
+        pseudo_label = (
+            self.pseudo_regime_label(cur_offset) if is_rcls_delta(self.args.model) else ""
+        )
         rows = []
         for stock_idx in range(self.config["stock_num"]):
             rows.append(
@@ -442,10 +767,17 @@ class Trainer:
                     "market_vol_lookback": market_vol,
                     "synchronism_lookback": synchronism,
                     "dispersion_lookback": dispersion,
+                    "mean_abs_ret_lookback": mean_abs_ret,
                     "stress_source": "lookback",
                     "regime_0": gate0,
                     "regime_1": gate1,
                     "regime_2": gate2,
+                    "gate_entropy": gate_entropy,
+                    "dominant_regime": dominant_regime,
+                    "delta_norm": delta_norm,
+                    "base_norm": base_norm,
+                    "delta_scale": delta_scale,
+                    "pseudo_regime_label": pseudo_label,
                 }
             )
         return rows
@@ -458,6 +790,7 @@ class Trainer:
             cur_valid_gt = np.zeros([stock_num, end_index - start_index], dtype=float)
             cur_valid_mask = np.zeros([stock_num, end_index - start_index], dtype=float)
             rows = []
+            gate_rows = []
             loss = 0.0
             reg_loss = 0.0
             rank_loss = 0.0
@@ -494,26 +827,27 @@ class Trainer:
                             mask_batch,
                         )
                     )
+                    gate_rows.append(self.gate_feature_row(split_name, cur_offset))
             denom = end_index - start_index
             loss = loss / denom
             reg_loss = reg_loss / denom
             rank_loss = rank_loss / denom
             cur_valid_perf = evaluate(cur_valid_pred, cur_valid_gt, cur_valid_mask)
         elapsed = time.time() - eval_start
-        return loss, reg_loss, rank_loss, cur_valid_perf, rows, elapsed
+        return loss, reg_loss, rank_loss, cur_valid_perf, rows, gate_rows, elapsed
 
     def validate(self, start_index, end_index):
-        loss, reg_loss, rank_loss, perf, _, _ = self.evaluate_range(start_index, end_index)
+        loss, reg_loss, rank_loss, perf, _, _, _ = self.evaluate_range(start_index, end_index)
         return loss, reg_loss, rank_loss, perf
 
     def save_best_predictions(self):
         valid_index = self.config["valid_index"]
         test_index = self.config["test_index"]
         self.model.eval()
-        _, _, _, _, valid_rows, _ = self.evaluate_range(
+        _, _, _, _, valid_rows, valid_gate_rows, _ = self.evaluate_range(
             valid_index, test_index, split_name="valid", collect_rows=True
         )
-        _, _, _, _, test_rows, test_elapsed = self.evaluate_range(
+        _, _, _, _, test_rows, test_gate_rows, test_elapsed = self.evaluate_range(
             test_index, self.trade_dates, split_name="test", collect_rows=True
         )
         output = self.results_dir / "preds_{}_{}_seed{}.csv".format(
@@ -526,6 +860,19 @@ class Trainer:
                 writer.writerow(row)
             for row in test_rows:
                 writer.writerow(row)
+        gate_rows = valid_gate_rows + test_gate_rows
+        if is_rcls_delta(self.args.model) and gate_rows:
+            gate_output = self.results_dir / "gate_features_{}_{}_seed{}.csv".format(
+                self.args.model,
+                self.args.market,
+                self.result_seed,
+            )
+            with gate_output.open("w", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=GATE_FEATURE_COLUMNS)
+                writer.writeheader()
+                for row in gate_rows:
+                    writer.writerow(row)
+            print("Saved gate features: {}".format(gate_output))
         test_days = max(1, self.trade_dates - test_index)
         self.infer_time_ms_per_day = (test_elapsed / test_days) * 1000.0
         print("Saved predictions: {}".format(output))
@@ -559,6 +906,13 @@ class Trainer:
             "torch_seed": self.torch_seed,
             "git_commit": git_commit(),
             "device": self.device_name,
+            "delta_scale": safe_float(self.args.delta_scale),
+            "delta_trainable_scale": self.args.delta_trainable_scale,
+            "delta_dropout": safe_float(self.args.delta_dropout),
+            "gate_temperature": safe_float(self.args.gate_temperature),
+            "gate_feature_mode": self.args.gate_feature_mode,
+            "uniform_gate": self.args.uniform_gate,
+            "gate_pseudo_label": self.args.gate_pseudo_label,
         }
         upsert_csv_row(
             self.results_dir / "run_metadata.csv",
@@ -567,11 +921,57 @@ class Trainer:
             ["dataset", "model", "seed"],
         )
 
+    def set_base_freeze(self, epoch):
+        mixer = getattr(self.model, "stock_mixer", None)
+        base = getattr(mixer, "base_stock_mixer", None)
+        if base is None:
+            return
+        freeze = epoch < self.args.freeze_base_epochs
+        for param in base.parameters():
+            param.requires_grad = not freeze
+
+    def auxiliary_loss(self, offset, epoch):
+        if not is_rcls_delta(self.args.model):
+            return torch.tensor(0.0, device=self.device), {"gate": 0.0, "conf": 0.0, "div": 0.0}
+
+        aux_loss = torch.tensor(0.0, device=self.device)
+        components = {"gate": 0.0, "conf": 0.0, "div": 0.0}
+        logits = getattr(self.model, "last_gate_logits", None)
+        if self.args.gate_pseudo_label and logits is not None and logits.numel() > 1:
+            label = self.pseudo_regime_label(offset)
+            label = min(label, logits.numel() - 1)
+            label_t = torch.tensor([label], dtype=torch.long, device=logits.device)
+            logits_t = logits.view(1, -1)
+            if epoch < self.args.gate_pseudo_warmup_epochs:
+                weight = self.args.gate_pseudo_weight
+            else:
+                weight = self.args.gate_pseudo_final_weight
+            gate_loss = F.cross_entropy(logits_t, label_t)
+            aux_loss = aux_loss + weight * gate_loss
+            components["gate"] = float((weight * gate_loss).detach().cpu())
+
+        pi = getattr(self.model, "last_regime_prob", None)
+        if self.args.gate_confidence_weight > 0.0 and pi is not None and pi.numel() > 1:
+            probs = torch.clamp(pi, 1e-12, 1.0)
+            entropy = -(probs * probs.log()).sum()
+            conf_loss = self.args.gate_confidence_weight * entropy
+            aux_loss = aux_loss + conf_loss
+            components["conf"] = float(conf_loss.detach().cpu())
+
+        mixer = getattr(self.model, "stock_mixer", None)
+        if self.args.expert_diversity_weight > 0.0 and hasattr(mixer, "expert_diversity_loss"):
+            div = mixer.expert_diversity_loss()
+            div_loss = self.args.expert_diversity_weight * div
+            aux_loss = aux_loss + div_loss
+            components["div"] = float(div_loss.detach().cpu())
+
+        return aux_loss, components
+
     def train(self):
         stock_num = self.config["stock_num"]
         valid_index = self.config["valid_index"]
         test_index = self.config["test_index"]
-        train_steps = valid_index - self.args.lookback_length - self.args.steps + 1
+        train_steps = len(self.train_offsets)
         best_valid_loss = np.inf
         best_epoch = None
         best_valid_perf = None
@@ -588,15 +988,27 @@ class Trainer:
         for epoch in range(self.args.epochs):
             epochs_ran = epoch + 1
             print("epoch{}##########################################################".format(epoch + 1))
-            np.random.shuffle(self.batch_offsets)
+            epoch_offsets = self.train_offsets.copy()
+            np.random.shuffle(epoch_offsets)
+            self.set_base_freeze(epoch)
             self.model.train()
             epoch_train_start = time.time()
             tra_loss = 0.0
             tra_reg_loss = 0.0
             tra_rank_loss = 0.0
+            tra_aux_loss = 0.0
             for j in range(train_steps):
+                offset = int(epoch_offsets[j])
+                target_day = self.offset_target_day(offset)
+                if target_day >= valid_index:
+                    raise RuntimeError(
+                        "Training offset {} targets validation day {}".format(
+                            offset,
+                            target_day,
+                        )
+                    )
                 data_batch, mask_batch, price_batch, gt_batch = self.to_device(
-                    self.get_batch(self.batch_offsets[j])
+                    self.get_batch(offset)
                 )
                 self.optimizer.zero_grad()
                 prediction = self.model(data_batch)
@@ -608,19 +1020,23 @@ class Trainer:
                     stock_num,
                     self.args.alpha,
                 )
-                cur_loss.backward()
+                aux_loss, _ = self.auxiliary_loss(offset, epoch)
+                total_loss = cur_loss + aux_loss
+                total_loss.backward()
                 self.optimizer.step()
 
-                tra_loss += cur_loss.item()
+                tra_loss += total_loss.item()
                 tra_reg_loss += cur_reg_loss.item()
                 tra_rank_loss += cur_rank_loss.item()
+                tra_aux_loss += aux_loss.item()
             train_time_sec += time.time() - epoch_train_start
             tra_loss = tra_loss / train_steps
             tra_reg_loss = tra_reg_loss / train_steps
             tra_rank_loss = tra_rank_loss / train_steps
+            tra_aux_loss = tra_aux_loss / train_steps
             print(
-                "Train : loss:{:.2e}  =  {:.2e} + alpha*{:.2e}".format(
-                    tra_loss, tra_reg_loss, tra_rank_loss
+                "Train : loss:{:.2e}  =  {:.2e} + alpha*{:.2e} + aux:{:.2e}".format(
+                    tra_loss, tra_reg_loss, tra_rank_loss, tra_aux_loss
                 )
             )
 

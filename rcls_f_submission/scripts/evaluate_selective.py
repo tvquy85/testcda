@@ -12,6 +12,7 @@ RELIABILITY_COLUMNS = [
     "model",
     "seed",
     "confidence_source",
+    "selection_unit",
     "coverage",
     "num_days",
     "num_rows",
@@ -59,7 +60,7 @@ def add_confidence(df):
     return df, "abs_pred"
 
 
-def select_by_coverage(df, coverage):
+def select_stock_rows_by_coverage(df, coverage):
     rows = []
     for _, day_df in df.groupby("day_idx"):
         day_df = day_df.sort_values("confidence", ascending=False)
@@ -68,6 +69,17 @@ def select_by_coverage(df, coverage):
     if not rows:
         return df.iloc[0:0].copy()
     return pd.concat(rows, ignore_index=True)
+
+
+def select_days_by_coverage(df, coverage):
+    day_conf = df[["day_idx", "confidence"]].drop_duplicates("day_idx")
+    if day_conf.empty:
+        return df.iloc[0:0].copy()
+    keep = max(1, int(np.ceil(len(day_conf) * coverage)))
+    selected_days = set(
+        day_conf.sort_values("confidence", ascending=False).head(keep)["day_idx"]
+    )
+    return df[df["day_idx"].isin(selected_days)].copy()
 
 
 def summarize_file(path):
@@ -80,10 +92,14 @@ def summarize_file(path):
     model = str(df["model"].iloc[0])
     seed = int(df["seed"].iloc[0])
     df, confidence_source = add_confidence(df)
+    selection_unit = "day" if confidence_source == "gate_entropy" else "stock_row"
 
     rows = []
     for coverage in [1.0, 0.7, 0.5, 0.3]:
-        selected = select_by_coverage(df, coverage)
+        if selection_unit == "day":
+            selected = select_days_by_coverage(df, coverage)
+        else:
+            selected = select_stock_rows_by_coverage(df, coverage)
         metrics = compute_metrics(selected)
         rows.append(
             {
@@ -91,6 +107,7 @@ def summarize_file(path):
                 "model": model,
                 "seed": seed,
                 "confidence_source": confidence_source,
+                "selection_unit": selection_unit,
                 "coverage": coverage,
                 "num_days": metrics["num_days"],
                 "num_rows": metrics["num_rows"],

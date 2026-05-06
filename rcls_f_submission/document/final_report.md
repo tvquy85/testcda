@@ -12,10 +12,15 @@
 
 - Original stock mixer location: `NoGraphMixer` in `StockMixer`.
 - RCLS-F module: `rcls_f_submission/code/src/model_rcls.py`.
+- RCLS-Delta module: `rcls_f_submission/code/src/model_rcls_delta.py`.
 - Model variants:
   - `stockmixer`
   - `rcls_f_k1`
   - `rcls_f_k3`
+  - `rcls_delta_identity`
+  - `rcls_delta_k2_uniform`
+  - `rcls_delta_k2`
+  - `rcls_delta_k3`
 - Prediction saving: `rcls_f_submission/results/preds_<model>_<dataset>_seed<seed>.csv`.
 
 ## Main Results
@@ -57,6 +62,7 @@ Dataset | Subset | StockMixer RankIC | RCLS-F K=3 RankIC | Gain | P@10 Gain
 ## Reliability / Gate Diagnostics
 
 Paste or convert `results/summary_reliability.csv` and `results/gate_stats_*.csv` here.
+For RCLS-Delta, also use `results/summary_gate_behavior.csv` and `results/summary_gate_feature_corr.csv`.
 
 ```text
 Dataset | Model | Confidence source | Coverage | RankIC | P@10 | MAE
