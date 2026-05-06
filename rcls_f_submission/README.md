@@ -30,6 +30,18 @@ The pilot runs `stockmixer`, `rcls_f_k1`, and `rcls_f_k3` on `SP500` and `NASDAQ
 
 RCLS-Delta is the stabilized follow-up to the direct RCLS-F replacement. It preserves the original `NoGraphMixer` path and adds a small regime-conditioned low-rank residual correction driven only by lookback features.
 
+Config check:
+
+```powershell
+python rcls_f_submission/scripts/check_delta_config.py
+```
+
+Forward smoke:
+
+```powershell
+python rcls_f_submission/scripts/smoke_delta_forward.py
+```
+
 Smoke:
 
 ```powershell
@@ -42,10 +54,24 @@ NASDAQ comparison:
 powershell -ExecutionPolicy Bypass -File rcls_f_submission/scripts/run_rcls_delta_nasdaq.ps1
 ```
 
+Canonical NASDAQ Delta comparison:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File rcls_f_submission/scripts/run_delta_nasdaq_3090.ps1
+```
+
+Warm-start/control run:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File rcls_f_submission/scripts/run_delta_nasdaq_warmstart_3090.ps1
+```
+
 New diagnostics:
 
 ```text
 results/gate_features_<model>_<dataset>_seed<seed>.csv
+results/gate_stats.csv
+results/gate_stress_relation.csv
 results/summary_gate_behavior.csv
 results/summary_gate_feature_corr.csv
 ```

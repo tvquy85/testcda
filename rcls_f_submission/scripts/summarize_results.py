@@ -25,6 +25,9 @@ GATE_COLUMNS = [
     "dataset",
     "model",
     "seed",
+    "split",
+    "num_days",
+    "num_regimes",
     "regime",
     "mean_prob",
     "std_prob",
@@ -32,6 +35,19 @@ GATE_COLUMNS = [
     "max_prob",
     "dominant_count",
     "dominant_share",
+    "entropy_mean",
+    "entropy_std",
+]
+
+GATE_STRESS_COLUMNS = [
+    "dataset",
+    "model",
+    "seed",
+    "split",
+    "feature",
+    "regime",
+    "corr_pearson",
+    "corr_spearman",
 ]
 
 REFERENCE_COLUMNS = [
@@ -80,7 +96,14 @@ def parse_args():
     root = Path(__file__).resolve().parents[1]
     parser = argparse.ArgumentParser()
     parser.add_argument("--output-root", type=Path, default=root)
+    parser.add_argument("--results-dir", "--input-dir", dest="results_dir", type=Path, default=None)
     return parser.parse_args()
+
+
+def get_results_dir(args):
+    if args.results_dir is not None:
+        return args.results_dir
+    return args.output_root / "results"
 
 
 def safe_corr(a, b, method="pearson"):
@@ -89,6 +112,15 @@ def safe_corr(a, b, method="pearson"):
     if s1.nunique(dropna=True) < 2 or s2.nunique(dropna=True) < 2:
         return np.nan
     return s1.corr(s2, method=method)
+
+
+def entropy_from_probs(frame, regime_cols):
+    values = frame[regime_cols].to_numpy(dtype=float)
+    values = np.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0)
+    row_sum = values.sum(axis=1, keepdims=True)
+    values = np.divide(values, row_sum, out=np.zeros_like(values), where=row_sum > 0)
+    values = np.clip(values, 1e-12, 1.0)
+    return -(values * np.log(values)).sum(axis=1)
 
 
 def precision_at_k(day_df, k):
@@ -171,19 +203,26 @@ def write_gate_stats(path, results_dir):
     df = pd.read_csv(path)
     if "split" in df.columns:
         df = df[df["split"] == "test"]
+    if df.empty:
+        return []
     regime_cols = [c for c in ["regime_0", "regime_1", "regime_2"] if c in df.columns]
     if not regime_cols:
-        return
+        return []
     for col in regime_cols:
         df[col] = pd.to_numeric(df[col], errors="coerce")
     active_cols = [col for col in regime_cols if df[col].notna().any()]
     if not active_cols:
-        return
+        return []
 
     dataset = str(df["dataset"].iloc[0])
     model = str(df["model"].iloc[0])
     seed = int(df["seed"].iloc[0])
     day_probs = df[["day_idx"] + active_cols].drop_duplicates("day_idx")
+    ent = (
+        pd.to_numeric(df[["day_idx", "gate_entropy"]].drop_duplicates("day_idx")["gate_entropy"], errors="coerce")
+        if "gate_entropy" in df.columns
+        else pd.Series(entropy_from_probs(day_probs, active_cols))
+    )
     dominant = day_probs[active_cols].idxmax(axis=1)
     rows = []
     for col in active_cols:
@@ -194,17 +233,73 @@ def write_gate_stats(path, results_dir):
                 "dataset": dataset,
                 "model": model,
                 "seed": seed,
-                "regime": col.replace("regime_", ""),
+                "split": "test",
+                "num_days": int(day_probs["day_idx"].nunique()),
+                "num_regimes": len(active_cols),
+                "regime": col,
                 "mean_prob": values.mean(),
                 "std_prob": values.std(ddof=0),
                 "min_prob": values.min(),
                 "max_prob": values.max(),
                 "dominant_count": count,
                 "dominant_share": count / max(1, len(day_probs)),
+                "entropy_mean": ent.mean(),
+                "entropy_std": ent.std(ddof=0),
             }
         )
     output = results_dir / "gate_stats_{}_{}_seed{}.csv".format(dataset, model, seed)
     pd.DataFrame(rows, columns=GATE_COLUMNS).to_csv(output, index=False)
+    return rows
+
+
+def gate_stress_relation_rows(path):
+    df = pd.read_csv(path)
+    if "split" in df.columns:
+        df = df[df["split"] == "test"].copy()
+    if df.empty:
+        return []
+    regime_cols = [c for c in ["regime_0", "regime_1", "regime_2"] if c in df.columns]
+    for col in regime_cols:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    active_cols = [
+        col
+        for col in regime_cols
+        if df[col].notna().any() and df[col].nunique(dropna=True) > 1
+    ]
+    if not active_cols:
+        return []
+
+    feature_cols = [
+        "market_vol_lookback",
+        "synchronism_lookback",
+        "dispersion_lookback",
+        "mean_abs_ret_lookback",
+    ]
+    available_features = [col for col in feature_cols if col in df.columns]
+    for col in available_features:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    day_df = df[["day_idx"] + available_features + active_cols].drop_duplicates("day_idx")
+    dataset = str(df["dataset"].iloc[0])
+    model = str(df["model"].iloc[0])
+    seed = int(df["seed"].iloc[0])
+    rows = []
+    for feature in available_features:
+        if day_df[feature].nunique(dropna=True) < 2:
+            continue
+        for regime_col in active_cols:
+            rows.append(
+                {
+                    "dataset": dataset,
+                    "model": model,
+                    "seed": seed,
+                    "split": "test",
+                    "feature": feature,
+                    "regime": regime_col,
+                    "corr_pearson": safe_corr(day_df[feature], day_df[regime_col], "pearson"),
+                    "corr_spearman": safe_corr(day_df[feature], day_df[regime_col], "spearman"),
+                }
+            )
+    return rows
 
 
 def parse_baseline_reference(output_root):
@@ -307,16 +402,29 @@ def write_pilot_comparison(summary_rows, results_dir):
 
 def main():
     args = parse_args()
-    results_dir = args.output_root / "results"
+    results_dir = get_results_dir(args)
+    results_dir.mkdir(parents=True, exist_ok=True)
     rows = []
+    gate_rows = []
+    gate_stress_rows = []
     for path in sorted(results_dir.glob("preds_*.csv")):
         row = summarize_prediction_file(path)
         if row is not None:
             rows.append(row)
-        write_gate_stats(path, results_dir)
+        gate_rows.extend(write_gate_stats(path, results_dir))
+        gate_stress_rows.extend(gate_stress_relation_rows(path))
     output = results_dir / "summary_main.csv"
     pd.DataFrame(rows, columns=MAIN_COLUMNS).to_csv(output, index=False)
     print("Wrote {}".format(output))
+    gate_output = results_dir / "gate_stats.csv"
+    pd.DataFrame(gate_rows, columns=GATE_COLUMNS).to_csv(gate_output, index=False)
+    print("Wrote {}".format(gate_output))
+    gate_stress_output = results_dir / "gate_stress_relation.csv"
+    pd.DataFrame(gate_stress_rows, columns=GATE_STRESS_COLUMNS).to_csv(
+        gate_stress_output,
+        index=False,
+    )
+    print("Wrote {}".format(gate_stress_output))
     write_pilot_comparison(rows, results_dir)
     write_reference_baseline(args.output_root, results_dir)
 

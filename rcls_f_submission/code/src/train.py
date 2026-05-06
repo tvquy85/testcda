@@ -139,6 +139,47 @@ GATE_FEATURE_COLUMNS = [
     "pseudo_regime_label",
 ]
 
+CONFIG_SUMMARY_FIELDS = [
+    "model",
+    "dataset",
+    "num_regimes",
+    "uniform_gate",
+    "gate_feature_mode",
+    "gate_pseudo_label",
+    "gate_pseudo_weight",
+    "gate_pseudo_final_weight",
+    "gate_pseudo_warmup_epochs",
+    "gate_confidence_weight",
+    "expert_diversity_weight",
+    "delta_scale",
+    "delta_trainable_scale",
+    "delta_dropout",
+    "gate_temperature",
+    "freeze_base_epochs",
+    "warmstart_checkpoint",
+    "save_checkpoint",
+    "checkpoint_dir",
+    "results_dir",
+]
+
+EPOCH_DIAGNOSTIC_COLUMNS = [
+    "dataset",
+    "model",
+    "seed",
+    "epoch",
+    "loss_main",
+    "loss_gate_ce",
+    "loss_gate_confidence",
+    "loss_expert_diversity",
+    "loss_total",
+    "mean_gate_entropy",
+    "std_gate_entropy",
+    "mean_pi_0",
+    "mean_pi_1",
+    "mean_pi_2",
+    "pseudo_label_counts",
+]
+
 METADATA_COLUMNS = [
     "dataset",
     "model",
@@ -159,6 +200,7 @@ METADATA_COLUMNS = [
     "torch_seed",
     "git_commit",
     "device",
+    "num_regimes",
     "delta_scale",
     "delta_trainable_scale",
     "delta_dropout",
@@ -166,10 +208,19 @@ METADATA_COLUMNS = [
     "gate_feature_mode",
     "uniform_gate",
     "gate_pseudo_label",
+    "gate_pseudo_weight",
+    "gate_pseudo_final_weight",
+    "gate_pseudo_warmup_epochs",
+    "gate_confidence_weight",
+    "expert_diversity_weight",
+    "freeze_base_epochs",
+    "warmstart_checkpoint",
+    "save_checkpoint",
+    "checkpoint_dir",
 ]
 
 
-def parse_args():
+def parse_args(argv=None):
     submission_root = Path(__file__).resolve().parents[2]
     repo_root = submission_root.parent
     parser = argparse.ArgumentParser(
@@ -216,6 +267,22 @@ def parse_args():
         default=submission_root,
         help="Root where logs/results/document live.",
     )
+    parser.add_argument(
+        "--results-dir",
+        "--input-dir",
+        dest="results_dir",
+        type=Path,
+        default=None,
+        help="Directory for result CSVs. Defaults to <output-root>/results.",
+    )
+    parser.add_argument(
+        "--checkpoint-dir",
+        type=Path,
+        default=None,
+        help="Directory for saved checkpoints. Defaults to <output-root>/checkpoints.",
+    )
+    parser.add_argument("--save-checkpoint", type=str_to_bool, default=False)
+    parser.add_argument("--dry-run", type=str_to_bool, default=False)
     parser.add_argument("--lookback-length", type=int, default=16)
     parser.add_argument("--fea-num", type=int, default=5)
     parser.add_argument("--steps", type=int, default=1)
@@ -274,7 +341,7 @@ def parse_args():
         action="store_true",
         help="Disable best-epoch prediction CSV writing.",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     return resolve_args(parser, args)
 
 
@@ -322,12 +389,21 @@ def resolve_args(parser, args):
         args.numpy_seed = BASE_NUMPY_SEED + args.seed
     if args.torch_seed is None:
         args.torch_seed = BASE_TORCH_SEED + args.seed
+
+    if args.results_dir is None:
+        args.results_dir = args.output_root / "results"
+    if args.checkpoint_dir is None:
+        args.checkpoint_dir = args.output_root / "checkpoints"
+
     if is_rcls_delta(args.model):
         args.num_regimes = variant_num_regimes(args.model, args.num_regimes)
         if args.model.endswith("_uniform"):
             args.uniform_gate = True
             args.gate_pseudo_label = False
+            args.gate_pseudo_weight = 0.0
+            args.gate_pseudo_final_weight = 0.0
             args.gate_confidence_weight = 0.0
+            args.expert_diversity_weight = 0.0
         if args.model.endswith("_nostress"):
             args.gate_feature_mode = "embedding_only"
         if args.model == "rcls_delta_identity":
@@ -336,15 +412,50 @@ def resolve_args(parser, args):
             args.delta_trainable_scale = False
             args.uniform_gate = True
             args.gate_pseudo_label = False
+            args.gate_pseudo_weight = 0.0
+            args.gate_pseudo_final_weight = 0.0
+            args.gate_confidence_weight = 0.0
+            args.expert_diversity_weight = 0.0
+        if args.model == "rcls_delta_k1":
+            args.num_regimes = 1
+            args.gate_pseudo_label = False
+            args.gate_pseudo_weight = 0.0
+            args.gate_pseudo_final_weight = 0.0
             args.gate_confidence_weight = 0.0
             args.expert_diversity_weight = 0.0
     else:
         args.uniform_gate = False
         args.gate_pseudo_label = False
+        args.gate_pseudo_weight = 0.0
+        args.gate_pseudo_final_weight = 0.0
         args.gate_confidence_weight = 0.0
         args.expert_diversity_weight = 0.0
     args.save_predictions = not args.no_save_predictions
     return args
+
+
+def selected_config(args):
+    output = {}
+    for name in CONFIG_SUMMARY_FIELDS:
+        value = getattr(args, name, "")
+        if isinstance(value, Path):
+            value = str(value)
+        output[name] = value
+    return output
+
+
+def serializable_args(args):
+    output = {}
+    for key, value in vars(args).items():
+        if isinstance(value, Path):
+            value = str(value)
+        output[key] = value
+    return output
+
+
+def print_selected_config(args):
+    print("Selected RCLS-Delta config:")
+    print(json.dumps(selected_config(args), indent=2, sort_keys=True))
 
 
 def get_device(required_gpu):
@@ -528,8 +639,11 @@ class Trainer:
             raise ValueError("No valid training offsets for this configuration.")
         self.train_offsets = np.arange(start=0, stop=self.train_offset_end, dtype=int)
         self.output_root = args.output_root.resolve()
-        self.results_dir = self.output_root / "results"
+        self.results_dir = args.results_dir.resolve()
+        self.checkpoint_dir = args.checkpoint_dir.resolve()
         self.results_dir.mkdir(parents=True, exist_ok=True)
+        if args.save_checkpoint:
+            self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         self.infer_time_ms_per_day = 0.0
         self.regime_stats = self.fit_regime_stats(self.train_offsets)
 
@@ -565,8 +679,14 @@ class Trainer:
         path = Path(checkpoint)
         if not path.exists():
             raise FileNotFoundError("Warmstart checkpoint not found: {}".format(path))
-        payload = torch.load(path, map_location=self.device)
-        state_dict = payload.get("state_dict", payload) if isinstance(payload, dict) else payload
+        try:
+            payload = torch.load(path, map_location=self.device, weights_only=False)
+        except TypeError:
+            payload = torch.load(path, map_location=self.device)
+        if isinstance(payload, dict):
+            state_dict = payload.get("model_state_dict", payload.get("state_dict", payload))
+        else:
+            state_dict = payload
         missing, unexpected = self.model.load_state_dict(state_dict, strict=False)
         print(
             "Loaded warmstart checkpoint {} | missing={} | unexpected={}".format(
@@ -575,6 +695,31 @@ class Trainer:
                 len(unexpected),
             )
         )
+
+    def checkpoint_path(self):
+        name = "{}_{}_seed{}_best.pt".format(
+            self.args.model,
+            self.args.market,
+            self.result_seed,
+        )
+        return self.checkpoint_dir / name
+
+    def save_checkpoint(self, best_epoch, best_valid_loss, optimizer_state_dict=None):
+        if not self.args.save_checkpoint:
+            return
+        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        if optimizer_state_dict is None:
+            optimizer_state_dict = self.optimizer.state_dict()
+        payload = {
+            "model_state_dict": self.model.state_dict(),
+            "optimizer_state_dict": optimizer_state_dict,
+            "args": serializable_args(self.args),
+            "best_epoch": best_epoch,
+            "best_valid_loss": safe_float(best_valid_loss),
+        }
+        path = self.checkpoint_path()
+        torch.save(payload, path)
+        print("Saved checkpoint: {}".format(path))
 
     def offset_target_day(self, offset):
         return offset + self.args.lookback_length + self.args.steps - 1
@@ -906,6 +1051,7 @@ class Trainer:
             "torch_seed": self.torch_seed,
             "git_commit": git_commit(),
             "device": self.device_name,
+            "num_regimes": self.args.num_regimes,
             "delta_scale": safe_float(self.args.delta_scale),
             "delta_trainable_scale": self.args.delta_trainable_scale,
             "delta_dropout": safe_float(self.args.delta_dropout),
@@ -913,6 +1059,15 @@ class Trainer:
             "gate_feature_mode": self.args.gate_feature_mode,
             "uniform_gate": self.args.uniform_gate,
             "gate_pseudo_label": self.args.gate_pseudo_label,
+            "gate_pseudo_weight": safe_float(self.args.gate_pseudo_weight),
+            "gate_pseudo_final_weight": safe_float(self.args.gate_pseudo_final_weight),
+            "gate_pseudo_warmup_epochs": self.args.gate_pseudo_warmup_epochs,
+            "gate_confidence_weight": safe_float(self.args.gate_confidence_weight),
+            "expert_diversity_weight": safe_float(self.args.expert_diversity_weight),
+            "freeze_base_epochs": self.args.freeze_base_epochs,
+            "warmstart_checkpoint": self.args.warmstart_checkpoint,
+            "save_checkpoint": self.args.save_checkpoint,
+            "checkpoint_dir": str(self.checkpoint_dir),
         }
         upsert_csv_row(
             self.results_dir / "run_metadata.csv",
@@ -967,6 +1122,20 @@ class Trainer:
 
         return aux_loss, components
 
+    def write_epoch_diagnostics(self, rows):
+        if not rows:
+            return
+        output = self.results_dir / "epoch_diagnostics_{}_{}_seed{}.csv".format(
+            self.args.model,
+            self.args.market,
+            self.result_seed,
+        )
+        with output.open("w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=EPOCH_DIAGNOSTIC_COLUMNS)
+            writer.writeheader()
+            for row in rows:
+                writer.writerow(row)
+
     def train(self):
         stock_num = self.config["stock_num"]
         valid_index = self.config["valid_index"]
@@ -977,9 +1146,11 @@ class Trainer:
         best_valid_perf = None
         best_test_perf = None
         best_state = None
+        best_optimizer_state = None
         epochs_without_improvement = 0
         train_time_sec = 0.0
         epochs_ran = 0
+        epoch_diagnostics = []
 
         if self.device.type == "cuda":
             torch.cuda.reset_peak_memory_stats()
@@ -993,10 +1164,17 @@ class Trainer:
             self.set_base_freeze(epoch)
             self.model.train()
             epoch_train_start = time.time()
-            tra_loss = 0.0
+            tra_total_loss = 0.0
+            tra_main_loss = 0.0
             tra_reg_loss = 0.0
             tra_rank_loss = 0.0
             tra_aux_loss = 0.0
+            tra_gate_loss = 0.0
+            tra_conf_loss = 0.0
+            tra_div_loss = 0.0
+            gate_entropies = []
+            gate_probs = []
+            pseudo_counts = {}
             for j in range(train_steps):
                 offset = int(epoch_offsets[j])
                 target_day = self.offset_target_day(offset)
@@ -1020,25 +1198,81 @@ class Trainer:
                     stock_num,
                     self.args.alpha,
                 )
-                aux_loss, _ = self.auxiliary_loss(offset, epoch)
+                aux_loss, aux_components = self.auxiliary_loss(offset, epoch)
                 total_loss = cur_loss + aux_loss
                 total_loss.backward()
                 self.optimizer.step()
 
-                tra_loss += total_loss.item()
+                if is_rcls_delta(self.args.model):
+                    label = self.pseudo_regime_label(offset)
+                    pseudo_counts[label] = pseudo_counts.get(label, 0) + 1
+                pi = getattr(self.model, "last_regime_prob", None)
+                if pi is not None:
+                    pi_np = pi.detach().cpu().numpy()
+                    if pi_np.ndim == 2:
+                        pi_np = pi_np[0]
+                    pi_np = np.asarray(pi_np, dtype=float)
+                    gate_probs.append(pi_np)
+                    entropy = gate_entropy_from_probs(pi_np.tolist())
+                    if entropy != "":
+                        gate_entropies.append(float(entropy))
+
+                tra_total_loss += total_loss.item()
+                tra_main_loss += cur_loss.item()
                 tra_reg_loss += cur_reg_loss.item()
                 tra_rank_loss += cur_rank_loss.item()
                 tra_aux_loss += aux_loss.item()
+                tra_gate_loss += aux_components["gate"]
+                tra_conf_loss += aux_components["conf"]
+                tra_div_loss += aux_components["div"]
             train_time_sec += time.time() - epoch_train_start
-            tra_loss = tra_loss / train_steps
+            tra_total_loss = tra_total_loss / train_steps
+            tra_main_loss = tra_main_loss / train_steps
             tra_reg_loss = tra_reg_loss / train_steps
             tra_rank_loss = tra_rank_loss / train_steps
             tra_aux_loss = tra_aux_loss / train_steps
+            tra_gate_loss = tra_gate_loss / train_steps
+            tra_conf_loss = tra_conf_loss / train_steps
+            tra_div_loss = tra_div_loss / train_steps
             print(
                 "Train : loss:{:.2e}  =  {:.2e} + alpha*{:.2e} + aux:{:.2e}".format(
-                    tra_loss, tra_reg_loss, tra_rank_loss, tra_aux_loss
+                    tra_total_loss, tra_reg_loss, tra_rank_loss, tra_aux_loss
                 )
             )
+
+            mean_pi = ["", "", ""]
+            if gate_probs:
+                max_width = max(len(values) for values in gate_probs)
+                padded = np.full((len(gate_probs), max_width), np.nan, dtype=float)
+                for idx, values in enumerate(gate_probs):
+                    padded[idx, : len(values)] = values
+                means = np.nanmean(padded, axis=0).tolist()
+                for idx, value in enumerate(means[:3]):
+                    mean_pi[idx] = safe_float(value)
+            if is_rcls_delta(self.args.model):
+                diagnostic = {
+                    "dataset": self.args.market,
+                    "model": self.args.model,
+                    "seed": self.result_seed,
+                    "epoch": epoch + 1,
+                    "loss_main": safe_float(tra_main_loss),
+                    "loss_gate_ce": safe_float(tra_gate_loss),
+                    "loss_gate_confidence": safe_float(tra_conf_loss),
+                    "loss_expert_diversity": safe_float(tra_div_loss),
+                    "loss_total": safe_float(tra_total_loss),
+                    "mean_gate_entropy": (
+                        safe_float(np.mean(gate_entropies)) if gate_entropies else ""
+                    ),
+                    "std_gate_entropy": (
+                        safe_float(np.std(gate_entropies)) if gate_entropies else ""
+                    ),
+                    "mean_pi_0": mean_pi[0],
+                    "mean_pi_1": mean_pi[1],
+                    "mean_pi_2": mean_pi[2],
+                    "pseudo_label_counts": json.dumps(pseudo_counts, sort_keys=True),
+                }
+                epoch_diagnostics.append(diagnostic)
+                self.write_epoch_diagnostics(epoch_diagnostics)
 
             self.model.eval()
             val_loss, val_reg_loss, val_rank_loss, val_perf = self.validate(
@@ -1068,6 +1302,7 @@ class Trainer:
                     key: value.detach().cpu().clone()
                     for key, value in self.model.state_dict().items()
                 }
+                best_optimizer_state = self.optimizer.state_dict()
                 epochs_without_improvement = 0
             else:
                 epochs_without_improvement += 1
@@ -1101,6 +1336,7 @@ class Trainer:
             best_epoch,
             best_valid_loss,
         )
+        self.save_checkpoint(best_epoch, best_valid_loss, best_optimizer_state)
 
         return {
             "best_epoch": best_epoch,
@@ -1144,12 +1380,19 @@ def run_once(args, run_index, device, data, device_name):
 def main():
     args = parse_args()
     args.output_root.mkdir(parents=True, exist_ok=True)
-    (args.output_root / "results").mkdir(parents=True, exist_ok=True)
+    args.results_dir.mkdir(parents=True, exist_ok=True)
     (args.output_root / "logs").mkdir(parents=True, exist_ok=True)
+    if args.save_checkpoint:
+        args.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    if args.dry_run:
+        print(json.dumps(selected_config(args), indent=2, sort_keys=True))
+        return
+    print_selected_config(args)
     device, device_name = get_device(args.require_gpu)
     print("Using device: {} ({})".format(device, device_name))
     print("Dataset root: {}".format(args.dataset_root.resolve()))
     print("Output root: {}".format(args.output_root.resolve()))
+    print("Results dir: {}".format(args.results_dir.resolve()))
 
     data = load_market_data(args.dataset_root, args.market, args.steps)
     results = []

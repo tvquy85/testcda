@@ -27,8 +27,15 @@ def parse_args():
     root = Path(__file__).resolve().parents[1]
     parser = argparse.ArgumentParser()
     parser.add_argument("--output-root", type=Path, default=root)
+    parser.add_argument("--results-dir", "--input-dir", dest="results_dir", type=Path, default=None)
     parser.add_argument("--top-frac", type=float, default=0.30)
     return parser.parse_args()
+
+
+def get_results_dir(args):
+    if args.results_dir is not None:
+        return args.results_dir
+    return args.output_root / "results"
 
 
 def top_days(day_df, column, frac):
@@ -103,7 +110,8 @@ def summarize_file(path, top_frac):
 
 def main():
     args = parse_args()
-    results_dir = args.output_root / "results"
+    results_dir = get_results_dir(args)
+    results_dir.mkdir(parents=True, exist_ok=True)
     rows = []
     for path in sorted(results_dir.glob("preds_*.csv")):
         rows.extend(summarize_file(path, args.top_frac))
