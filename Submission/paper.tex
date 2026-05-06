@@ -1,0 +1,311 @@
+\documentclass{article}
+
+\usepackage{neurips_2026}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{booktabs}
+\usepackage{amsfonts}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{nicefrac}
+\usepackage{microtype}
+\usepackage{xcolor}
+\usepackage{graphicx}
+\usepackage{array}
+
+\title{RCLS-CAG: Regime-Conditioned Low-Rank Population Mixing for Non-Stationary Panel Forecasting}
+
+\author{Anonymous Authors}
+
+\newcommand{\method}{RCLS-CAG}
+\newcommand{\stockmixer}{StockMixer}
+\newcommand{\cag}{CAG-MLP}
+\newcommand{\rankic}{RankIC}
+\newcommand{\icir}{ICIR}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+Panel time-series forecasting requires predicting many interacting entities whose dependencies vary across non-stationary population-level regimes. Existing financial forecasting architectures often use static stock relation priors, dense stock-axis mixing, graph message passing, or attention mechanisms whose inductive biases can be brittle under abrupt shifts in volatility, dispersion, and market-mode synchrony. We propose RCLS-CAG, a regime-conditioned low-rank population mixing framework that reframes context-aware gated stock mixing as a single-regime instance and extends it with learned regime routing over lookback-only market summaries. RCLS-CAG keeps the lightweight multi-scale temporal encoder of StockMixer, computes leakage-safe market context features from the lookback window, and mixes entity representations through low-rank stock-to-market-to-stock experts selected by a population-level router. We also provide a paper-ready experimental protocol that separates Pearson IC, true Spearman RankIC, and ICIR, and reports stress-regime, gate, reliability, and efficiency diagnostics. In a 15-epoch seed-matched NASDAQ pilot, the single-regime context-gated model improves IC from 0.0241 to 0.0270 and P@10 from 0.4962 to 0.5030 over the matched StockMixer run, while the first learned two-regime variant does not yet improve average metrics because its gate collapses mostly to one expert. These results validate the experimental pipeline and the context-gated RCLS-CAG K1 anchor, while identifying router regularization as the main target before full 80--100 epoch confirmation.
+\end{abstract}
+
+\section{Introduction}
+
+Panel forecasting problems arise when a system contains many entities observed over time and the goal is to forecast all of them jointly. Financial markets are a stringent test case: a model must predict hundreds or thousands of assets from short lookback windows, while cross-sectional dependencies change with volatility, dispersion, crowding, and liquidity regimes. A useful architecture should therefore be accurate, computationally compact, robust to population-level regime shifts, and transparent enough to diagnose when its adaptive components are active.
+
+The StockMixer architecture \citep{stockmixer} is a strong starting point for this setting. It uses an MLP-style temporal encoder and a low-rank stock mixer that maps entities to a market bottleneck and back. This avoids explicit graph construction and quadratic attention. However, the stock mixer is static: the same stock-to-market and market-to-stock weights are used across calm, trending, high-volatility, and high-dispersion periods. A recent context-aware gated MLP experiment, which we call CAG-MLP, improves this static mixer by injecting hand-crafted market context into a gated stock-axis MLP, but it remains a single-regime model.
+
+This paper develops RCLS-CAG, a regime-conditioned low-rank population mixer. The method preserves the compact StockMixer encoder and reframes CAG-MLP as a K=1 fixed-universe RCLS instance. It then introduces K-regime low-rank experts and a learned router conditioned on lookback-only market summaries. The goal is not to replace the strong baseline with a large model, but to test whether a small number of regime-conditioned low-rank experts can improve ranking and stress robustness while maintaining practical efficiency.
+
+Our current contribution is deliberately empirical and diagnostic. We implement a new isolated pipeline under the NeurIPS format with leakage-safe context computation, corrected metrics, prediction-level logging, stress subsets, gate diagnostics, reliability analysis, and efficiency reporting. We run a 15-epoch NASDAQ seed-matched pilot using the same seed, split, and activation configuration as the controlled StockMixer baseline. The pilot shows that the CAG-MLP/RCLS-CAG K1 compatibility model is reproducible and improves several short-run metrics over StockMixer. It also shows that the first learned K=2 router is not yet ready for a full claim: it collapses to one regime and underperforms K1 in average metrics. This is a useful result for the paper because it separates a validated context-gated low-rank contribution from a still-open multi-regime routing problem.
+
+The paper makes four concrete contributions:
+\begin{enumerate}
+    \item We formulate context-aware stock mixing as a regime-conditioned low-rank population operator.
+    \item We provide an RCLS-CAG model family spanning StockMixer, CAG-MLP/K1, learned K=2, uniform, no-context, and no-gate ablations.
+    \item We repair the evaluation protocol by distinguishing Pearson IC, Spearman RankIC, and ICIR, and by adding stress, reliability, gate, and efficiency tables.
+    \item We report a seed-matched 15-epoch NASDAQ pilot that validates K1 reproduction and identifies gate collapse as the key failure mode for the first K=2 router.
+\end{enumerate}
+
+\section{Related work}
+
+\paragraph{MLP-based time-series and stock forecasting.}
+MLP-style architectures have become competitive in vision and time-series tasks because they can exchange information efficiently without attention \citep{mlpmixer,patchtst}. StockMixer adapts this idea to financial panels by combining indicator mixing, multi-scale temporal mixing, and stock-to-market-to-stock mixing \citep{stockmixer}. Compared with recurrent, graph, and attention baselines for stock movement prediction \citep{alstm,sthan,estimate}, StockMixer is attractive because it is simple, fast, and strongly tuned for short financial windows.
+
+\paragraph{Set and population operators.}
+Deep Sets and Set Transformer motivate architectures whose behavior is defined on unordered entity collections \citep{deepsets,settransformer}. The fixed-universe StockMixer and RCLS-CAG variants in this paper are not strictly variable-N set models because their stock-axis parameters depend on the asset universe. Still, they implement a population-level bottleneck operator that is useful as a fixed-universe precursor to fully set-native prototype variants.
+
+\paragraph{Regime shift and calibration.}
+Market regimes have long been modeled through latent states and volatility dynamics. Recent work on reversible normalization and time-series distribution shift highlights the need to isolate changing distributional context \citep{revin}. For ranking under shift, average IC alone is insufficient. We therefore include stress-conditioned performance, gate-context correlations, and confidence-based selective metrics.
+
+\section{Method}
+
+\subsection{Problem setup}
+
+Let $X_t \in \mathbb{R}^{N \times T \times F}$ denote the lookback window for $N$ entities, $T$ time steps, and $F$ indicators. Following the StockMixer setup, the model predicts the next-day close price $\hat{p}_{i,t+1}$ for each entity and evaluates the predicted return
+\begin{equation}
+    \hat{r}_{i,t+1} = \frac{\hat{p}_{i,t+1} - p_{i,t}}{p_{i,t} + \epsilon}.
+\end{equation}
+The training objective keeps the baseline combination of a point loss and pairwise ranking loss,
+\begin{equation}
+    \mathcal{L}_{\mathrm{base}} =
+    \mathrm{MSE}(\hat{r} \odot m, r \odot m) +
+    \alpha_{\mathrm{rank}}\mathcal{L}_{\mathrm{pair}},
+\end{equation}
+where $m$ is the valid-asset mask and $\alpha_{\mathrm{rank}}=0.1$ in the baseline-matched experiments.
+
+\subsection{Lookback-only market context}
+
+For each training, validation, or test offset, we compute market context only from the lookback window. The context vector contains mean return, momentum slope, realized volatility, cross-sectional dispersion, PCA market-mode ratio, synchronism, downside volatility, mean absolute return, maximum absolute return, and fraction of positive returns. The model input uses the first five features in the baseline-matched pilot to remain close to the CAG-MLP implementation; all ten features are logged for diagnostics. The normalizer is fit only on training offsets and then applied to validation and test offsets.
+
+\subsection{RCLS-CAG population mixer}
+
+The temporal encoder follows StockMixer. It produces a stock representation matrix $H \in \mathbb{R}^{N \times D}$, where $D$ is the concatenated multi-scale temporal feature dimension. A stock-axis low-rank expert operates on $H^\top \in \mathbb{R}^{D \times N}$:
+\begin{align}
+    Y_k &= \mathrm{LN}(H^\top) W_{1,k}, \qquad Y_k = [Y^t_k, Y^g_k], \\
+    G_k &= \sigma(Y^g_k + c_k(q)), \\
+    O_k &= \left(\mathrm{HSwish}(Y^t_k) \odot G_k\right) W_{2,k},
+\end{align}
+where $q$ is the normalized context vector and $W_{1,k},W_{2,k}$ form the low-rank stock-to-market-to-stock expert for regime $k$. K1 is equivalent to the context-gated CAG-MLP stock mixer.
+
+For $K>1$, a router computes
+\begin{equation}
+    \pi = \mathrm{softmax}(g([q, \mathrm{pool}(H)]) / \tau),
+\end{equation}
+where $\mathrm{pool}(H)$ concatenates mean, standard deviation, maximum, and minimum across entities. The mixed representation is
+\begin{equation}
+    H' = H + \sum_{k=1}^{K}\pi_k O_k^\top.
+\end{equation}
+We evaluate ablations that use a uniform gate, remove context from the router and gate, or remove the sigmoid gate.
+
+\subsection{Diagnostics and evaluation protocol}
+
+We report Pearson IC, Spearman RankIC, ICIR, P@10, P@20, long-short return, MAE, stress-subset metrics, gate usage, gate-context correlation, confidence-based selective metrics, parameter count, runtime, and GPU memory. This separation is important because legacy stock papers sometimes use ``RIC'' to mean either Spearman RankIC or ICIR. In our new pipeline, RankIC always means Spearman correlation and ICIR means mean(IC)/std(IC).
+
+\section{Experimental setup}
+
+\paragraph{Dataset and split.}
+The pilot uses the NASDAQ panel with 1026 assets. We follow the StockMixer split: 756 training days, 252 validation days, and 273 held-out test days. Each sample uses a 16-day lookback window and predicts one day ahead.
+
+\paragraph{Baseline-matched configuration.}
+All pilot runs match the controlled StockMixer seed file: NumPy seed 123456789, PyTorch seed 12345678, HardSwish activation for the main mixer, GELU for the scale mixer, HardSwish for the stock mixer, learning rate $10^{-3}$, and ranking weight $0.1$. We use 15 epochs to validate the experimental structure before the full 80--100 epoch confirmation. The run label seed is 0.
+
+\paragraph{Models.}
+We run seven required NASDAQ models: StockMixer, CAG-MLP, RCLS-CAG K1, RCLS-CAG K2, RCLS-CAG K2 Uniform, RCLS-CAG K2 NoContext, and RCLS-CAG K2 NoGate. RCLS-CAG K1 is implemented as a compatibility model and should match CAG-MLP.
+
+\section{Results}
+
+\subsection{Main metrics}
+
+Table~\ref{tab:main} reports held-out test performance after selecting the best checkpoint by validation loss. CAG-MLP and RCLS-CAG K1 exactly match, confirming the compatibility gate. They improve short-run IC, ICIR, P@10, P@20, long-short return, and MAE over the 15-epoch StockMixer run, while StockMixer is marginally higher in true RankIC. The first learned K2 router does not improve over K1 and reduces P@10. Uniform and no-gate ablations perform substantially worse.
+
+\begin{table}[t]
+\centering
+\caption{NASDAQ 15-epoch seed-matched pilot. IC is Pearson; RankIC is Spearman; ICIR is mean(IC)/std(IC).}
+\label{tab:main}
+\resizebox{\linewidth}{!}{%
+\begin{tabular}{lrrrrrrr}
+\toprule
+Model & IC & RankIC & ICIR & P@10 & P@20 & Long-short & MAE \\
+\midrule
+StockMixer & 0.0241 & \textbf{0.0341} & 0.2901 & 0.4962 & 0.4852 & 0.00147 & 0.02294 \\
+CAG-MLP & \textbf{0.0270} & 0.0340 & \textbf{0.3367} & \textbf{0.5030} & \textbf{0.4926} & \textbf{0.00202} & \textbf{0.01926} \\
+RCLS-CAG K1 & \textbf{0.0270} & 0.0340 & \textbf{0.3367} & \textbf{0.5030} & \textbf{0.4926} & \textbf{0.00202} & \textbf{0.01926} \\
+RCLS-CAG K2 & 0.0227 & 0.0337 & 0.2885 & 0.4781 & 0.4878 & 0.00040 & 0.02748 \\
+RCLS-CAG K2 Uniform & 0.0052 & 0.0120 & 0.0745 & 0.4890 & 0.4816 & 0.00071 & 0.05511 \\
+RCLS-CAG K2 NoContext & 0.0232 & 0.0303 & 0.2973 & 0.4907 & 0.4920 & 0.00108 & 0.02813 \\
+RCLS-CAG K2 NoGate & 0.0162 & 0.0272 & 0.1947 & 0.4797 & 0.4850 & 0.00003 & 0.03056 \\
+\bottomrule
+\end{tabular}}
+\end{table}
+
+\subsection{Stress-regime behavior}
+
+Table~\ref{tab:stress} focuses on high-volatility and high-synchronism subsets, two stress conditions derived from logged context columns. The pilot suggests that CAG/K1 is particularly strong under high synchronism, while StockMixer remains competitive under high volatility. K2 improves RankIC slightly over K1 on high-synchronism days but is weaker on all-day and high-volatility metrics.
+
+\begin{table}[t]
+\centering
+\caption{Stress subset metrics for selected models.}
+\label{tab:stress}
+\resizebox{\linewidth}{!}{%
+\begin{tabular}{llrrrr}
+\toprule
+Model & Subset & IC & RankIC & ICIR & P@10 \\
+\midrule
+StockMixer & high volatility & \textbf{0.0258} & \textbf{0.0425} & 0.2938 & 0.5040 \\
+CAG-MLP/K1 & high volatility & 0.0225 & 0.0395 & \textbf{0.3058} & \textbf{0.5120} \\
+RCLS-CAG K2 & high volatility & 0.0150 & 0.0359 & 0.1868 & 0.4933 \\
+\midrule
+StockMixer & high synchronism & 0.0388 & 0.0508 & 0.4533 & 0.4947 \\
+CAG-MLP/K1 & high synchronism & \textbf{0.0419} & 0.0525 & \textbf{0.5031} & \textbf{0.5200} \\
+RCLS-CAG K2 & high synchronism & 0.0408 & \textbf{0.0562} & 0.4781 & 0.4973 \\
+\bottomrule
+\end{tabular}}
+\end{table}
+
+\subsection{Gate diagnostics}
+
+Table~\ref{tab:gate} shows that the learned K2 gate is not yet alive enough for a full multi-regime claim. RCLS-CAG K2 assigns mean probability 0.985 to regime 0 and never changes its dominant regime on the test set. The no-context variant uses both regimes more evenly, but it does not improve metrics. Gate-context correlations nevertheless show that the small probability assigned to regime 1 is positively correlated with realized volatility, downside volatility, PCA ratio, and synchronism. This suggests the router has learned a stress direction but the objective and temperature are not yet calibrated to use both experts effectively.
+
+\begin{table}[t]
+\centering
+\caption{Gate usage on NASDAQ test days.}
+\label{tab:gate}
+\begin{tabular}{lrrrr}
+\toprule
+Model & Regime & Mean prob. & Std. prob. & Dominant share \\
+\midrule
+RCLS-CAG K2 & 0 & 0.9854 & 0.0279 & 1.0000 \\
+RCLS-CAG K2 & 1 & 0.0146 & 0.0279 & 0.0000 \\
+RCLS-CAG K2 Uniform & 0 & 0.5000 & 0.0000 & 1.0000 \\
+RCLS-CAG K2 Uniform & 1 & 0.5000 & 0.0000 & 0.0000 \\
+RCLS-CAG K2 NoContext & 0 & 0.5832 & 0.1362 & 0.7342 \\
+RCLS-CAG K2 NoContext & 1 & 0.4168 & 0.1362 & 0.2658 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Reliability and efficiency}
+
+The reliability analysis ranks either rows by absolute prediction magnitude or days by gate entropy. For CAG/K1, selecting the top 30\% most confident rows by absolute score increases IC from 0.0270 to 0.0341 and RankIC from 0.0340 to 0.0436. For RCLS-CAG K2, selecting the lowest-entropy half of test days increases IC from 0.0227 to 0.0283, but further narrowing to 30\% hurts RankIC, again indicating that the current router signal is not yet stable enough.
+
+Table~\ref{tab:eff} reports efficiency. RCLS-CAG K2 uses fewer parameters than CAG/K1 because the pilot K2 implementation uses two low-rank experts with a smaller effective context-gated structure than the compatibility CAG block. All models are small in VRAM at this scale; runtime differences are dominated by sequential daily training rather than model size.
+
+\begin{table}[t]
+\centering
+\caption{Efficiency in the 15-epoch NASDAQ pilot.}
+\label{tab:eff}
+\begin{tabular}{lrrrr}
+\toprule
+Model & Params & Train sec. & Peak VRAM GB & Size MB \\
+\midrule
+StockMixer & 45,077 & 296.2 & 0.0430 & 0.172 \\
+CAG-MLP/K1 & 195,813 & 316.4 & 0.0454 & 0.747 \\
+RCLS-CAG K2 & 139,557 & 338.3 & 0.0450 & 0.532 \\
+K2 Uniform & 139,557 & 318.0 & 0.0446 & 0.532 \\
+K2 NoContext & 139,557 & 327.0 & 0.0450 & 0.532 \\
+K2 NoGate & 139,557 & 321.3 & 0.0450 & 0.532 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Discussion}
+
+The 15-epoch pilot supports two conclusions. First, context-gated low-rank stock mixing is a viable anchor. The fact that CAG-MLP and RCLS-CAG K1 match exactly is important: it means the new pipeline can reproduce the existing context-gated baseline while also producing corrected metrics, stress diagnostics, and reliability tables. Second, a learned multi-regime router requires more care than simply adding K experts. The K2 model learns a stress-correlated direction but mostly routes to one expert, which prevents the multi-regime model from improving over K1.
+
+For a NeurIPS submission, this distinction is valuable. A strong final paper should avoid claiming that the current K2 router already solves regime shift. Instead, the paper should present RCLS-CAG as a framework, use K1/CAG as the validated context-conditioned low-rank instance, and treat K2 as the main experimental target for the next full run after improving the router objective. Concrete next steps are to lower the router temperature, strengthen pseudo-regime cross-entropy, add an explicit occupancy regularizer, and select checkpoints by a validation composite that includes IC/RankIC/P@10 rather than validation loss alone.
+
+\section{Limitations}
+
+This draft reports a 15-epoch seed-matched NASDAQ pilot, not a full NeurIPS-scale evaluation. The results should be used to validate pipeline structure and write the experimental narrative, but not to make final performance claims. The current RCLS-CAG K2 router collapses mostly to one expert; therefore the multi-regime claim is not yet empirically established. The implementation is fixed-universe because stock-axis parameters depend on the NASDAQ asset count, so strict variable-N set claims should be reserved for a future prototype-based RCLS variant. The pilot also reports a single seed and one dataset; full conclusions require 80--100 epoch confirmation, additional seeds, and SP500 or other panel benchmarks.
+
+\section{Conclusion}
+
+We introduced RCLS-CAG, a regime-conditioned low-rank population mixing framework for non-stationary panel forecasting. The current implementation validates the single-regime CAG/K1 anchor and provides a paper-ready evaluation pipeline with corrected metrics, stress diagnostics, gate analysis, reliability subsets, and efficiency reporting. The 15-epoch pilot shows that context-gated low-rank mixing improves several short-run metrics over StockMixer, while the first K2 router is not yet reliable enough for a full multi-regime claim. This positions the next experimental stage clearly: improve gate usage and then run full 80--100 epoch, multi-seed confirmation under the same baseline-matched configuration.
+
+\begin{thebibliography}{99}
+
+\bibitem[Angelopoulos and Bates(2021)]{conformal}
+Angelopoulos, A. N. and Bates, S. (2021).
+A gentle introduction to conformal prediction and distribution-free uncertainty quantification.
+\emph{arXiv preprint arXiv:2107.07511}.
+
+\bibitem[Feng et~al.(2018)]{alstm}
+Feng, F., Chen, H., He, X., Ding, J., Sun, M., and Chua, T.-S. (2018).
+Enhancing stock movement prediction with adversarial training.
+\emph{arXiv preprint arXiv:1810.09936}.
+
+\bibitem[Fan and Shen(2024)]{stockmixer}
+Fan, J. and Shen, Y. (2024).
+StockMixer: A simple yet strong MLP-based architecture for stock price forecasting.
+\emph{Proceedings of the AAAI Conference on Artificial Intelligence}.
+
+\bibitem[Huynh et~al.(2023)]{estimate}
+Huynh, T. T., Nguyen, M. H., Nguyen, T. T., Nguyen, P. L., Weidlich, M., Nguyen, Q. V. H., and Aberer, K. (2023).
+Efficient integration of multi-order dynamics and internal dynamics in stock movement prediction.
+\emph{Proceedings of WSDM}.
+
+\bibitem[Kim et~al.(2021)]{revin}
+Kim, T., Kim, J., Tae, Y., Park, C., Choi, J.-H., and Choo, J. (2021).
+Reversible instance normalization for accurate time-series forecasting against distribution shift.
+\emph{International Conference on Learning Representations}.
+
+\bibitem[Lee et~al.(2019)]{settransformer}
+Lee, J., Lee, Y., Kim, J., Kosiorek, A., Choi, S., and Teh, Y. W. (2019).
+Set Transformer: A framework for attention-based permutation-invariant neural networks.
+\emph{International Conference on Machine Learning}.
+
+\bibitem[Nie et~al.(2023)]{patchtst}
+Nie, Y., Nguyen, N. H., Sinthong, P., and Kalagnanam, J. (2023).
+A time series is worth 64 words: Long-term forecasting with transformers.
+\emph{International Conference on Learning Representations}.
+
+\bibitem[Sawhney et~al.(2021)]{sthan}
+Sawhney, R., Agarwal, S., Wadhwa, A., Derr, T., and Shah, R. R. (2021).
+Stock selection via spatiotemporal hypergraph attention network: A learning to rank approach.
+\emph{Proceedings of the AAAI Conference on Artificial Intelligence}.
+
+\bibitem[Tolstikhin et~al.(2021)]{mlpmixer}
+Tolstikhin, I. O., Houlsby, N., Kolesnikov, A., Beyer, L., Zhai, X., Unterthiner, T., Yung, J., Steiner, A., Keysers, D., Uszkoreit, J., et al. (2021).
+MLP-Mixer: An all-MLP architecture for vision.
+\emph{Advances in Neural Information Processing Systems}.
+
+\bibitem[Zaheer et~al.(2017)]{deepsets}
+Zaheer, M., Kottur, S., Ravanbakhsh, S., Poczos, B., Salakhutdinov, R., and Smola, A. (2017).
+Deep Sets.
+\emph{Advances in Neural Information Processing Systems}.
+
+\end{thebibliography}
+
+\appendix
+
+\section{Additional reproducibility details}
+
+The pilot outputs are stored under \texttt{Exp/RCLS/results/paper15\_seed1\_match/}. The main scripts are \texttt{Exp/RCLS/train\_rcls.py}, \texttt{Exp/RCLS/summarize\_results.py}, \texttt{Exp/RCLS/evaluate\_stress.py}, \texttt{Exp/RCLS/analyze\_gate.py}, \texttt{Exp/RCLS/evaluate\_reliability.py}, and \texttt{Exp/RCLS/profile\_efficiency.py}. Static checks and forward smoke tests passed before training. Every run records predictions, context features, regime probabilities, metadata, runtime, parameter count, and peak VRAM.
+
+\section*{NeurIPS Paper Checklist}
+
+\begin{enumerate}
+\item {\bf Claims.} \answerYes{} The abstract and introduction explicitly state that the reported evidence is a 15-epoch pilot and do not claim full confirmation.
+\item {\bf Limitations.} \answerYes{} The limitations section discusses single-seed, single-dataset, short-epoch, fixed-universe, and gate-collapse limitations.
+\item {\bf Theory assumptions and proofs.} \answerNA{} The paper introduces an empirical model and does not include formal theorems.
+\item {\bf Experimental result reproducibility.} \answerYes{} The experimental setup specifies seeds, activations, split, lookback, optimization settings, and output paths.
+\item {\bf Open access to data and code.} \answerNo{} The current draft is based on a local repository snapshot; public release status has not been finalized.
+\item {\bf Experimental setting/details.} \answerYes{} Dataset, split, metrics, model variants, and baseline-matched configuration are described.
+\item {\bf Experiment statistical significance.} \answerNo{} The pilot is a single-seed 15-epoch run; the paper explicitly defers multi-seed confirmation.
+\item {\bf Experiments compute resources.} \answerYes{} The efficiency table reports parameters, runtime, and peak VRAM on an RTX 3090.
+\item {\bf Code of ethics.} \answerYes{} The work is a forecasting-method study and is reported with limitations to avoid overstating trading utility.
+\item {\bf Broader impacts.} \answerYes{} The limitations discuss that financial forecasting can be misused if preliminary metrics are treated as deployable trading evidence.
+\item {\bf Safeguards.} \answerNA{} The work does not release a deployed system or user-facing model.
+\item {\bf Licenses for existing assets.} \answerNA{} The draft uses local benchmark data and code references; release licensing still needs to be checked before submission.
+\item {\bf New assets.} \answerNo{} The draft creates code and experiment outputs locally, but public asset release is not yet specified.
+\item {\bf Crowdsourcing and human subjects.} \answerNA{} The work does not involve crowdsourcing or human subjects.
+\item {\bf Large language models.} \answerNA{} LLMs are not part of the proposed forecasting method.
+\end{enumerate}
+
+\end{document}

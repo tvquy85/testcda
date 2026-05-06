@@ -1,0 +1,56 @@
+# NeurIPS 2026 Main Track Format Checklist
+
+Source captured from the NeurIPS 2026 Main Track Handbook page:
+https://neurips.cc/Conferences/2026/MainTrackHandbook
+
+Local source of truth for this repo:
+- LaTeX style: `Submission/neurips_2026.sty`
+- Main paper source: `Submission/paper.tex`
+- Build command: `.\tectonic.exe --keep-logs --keep-intermediates -p -o Submission\build Submission\paper.tex`
+
+Submission PDF requirements:
+- Submit one single PDF file.
+- Use the official NeurIPS 2026 LaTeX style file.
+- Do not use altered margins, altered font sizes, `fullpage`, or custom geometry overrides.
+- Maximum PDF file size: 50 MB.
+- Main content limit: 9 pages for initial submission, including figures and tables.
+- References, optional appendices, and the mandatory paper checklist do not count toward the 9-page main content limit.
+- Suggested PDF order: main paper content, references, appendices, NeurIPS paper checklist.
+
+Anonymous submission requirements:
+- Initial submission must be anonymized for double-blind review.
+- Do not use the `final`, `preprint`, or `nonanonymous` style options for anonymous submission.
+- Do not include acknowledgments at submission time.
+- Avoid author-identifying text, links, supplementary paths, or repository references unless anonymized.
+
+Camera-ready notes:
+- Accepted camera-ready papers may use an additional content page.
+- Camera-ready must include references, appendices, and checklist in the same PDF.
+- Camera-ready papers must include funding and competing-interest disclosures.
+
+Local automated checks:
+- Build:
+  `.\tectonic.exe --keep-logs --keep-intermediates -p -o Submission\build Submission\paper.tex`
+- Log scan:
+  `Select-String -Path Submission\build\paper.log -Pattern "error|undefined|Citation|Reference|Overfull|Underfull|Warning|Emergency stop|Fatal" -CaseSensitive:$false`
+- Size:
+  `Get-Item Submission\build\paper.pdf | Select-Object FullName,Length`
+- Source compliance:
+  `Select-String -Path Submission\paper.tex -Pattern "\\usepackage\[(final|preprint|nonanonymous)|\\begin\{ack\}|Acknowledgments|\\usepackage\{geometry\}|\\fontsize|\\addtolength|\\setlength\{\\textwidth|\\setlength\{\\textheight"`
+- Structure:
+  `Select-String -Path Submission\paper.tex -Pattern "^\\section|^\\appendix|^\\begin\{thebibliography\}|^\\section\*\{NeurIPS Paper Checklist\}"`
+
+Main-content page marker check:
+1. Insert this line immediately before `\begin{thebibliography}{99}` in a temporary copy:
+   `\typeout{RCLS_MAIN_CONTENT_PAGE=\thepage}`
+2. Build the temporary copy with Tectonic.
+3. Confirm `RCLS_MAIN_CONTENT_PAGE <= 9`.
+4. Delete the temporary copy after checking.
+
+Current checked state for `Submission/paper.tex`:
+- Built successfully with `tectonic.exe` 0.15.0.
+- Output PDF: `Submission/build/paper.pdf`.
+- PDF size: 73,271 bytes.
+- Total PDF length: 7 pages.
+- Main content marker: page 6, so main content is within the 9-page limit.
+- Format checks passed for anonymous submission.
